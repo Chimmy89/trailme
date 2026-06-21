@@ -60,13 +60,14 @@ enable_refresh_token_rotation = true
 refresh_token_reuse_interval = 10
 # MVP onboarding is invite/join-code driven (M5); open signup stays off.
 enable_signup = false
+# Weak-password floor. NOTE: this key lives under [auth], not [auth.email].
+minimum_password_length = 8
 
 [auth.email]
 # Email/password is the M0 auth method for both apps.
 enable_signup = true
 # Local dev confirms via Inbucket; production flips this on (see GDPR.md).
 enable_confirmations = false
-minimum_password_length = 8
 
 # Custom Access Token Hook — stamps app_metadata.org_id / role / site_ids from the
 # memberships table on every token issuance. Defined in migration 0004 as

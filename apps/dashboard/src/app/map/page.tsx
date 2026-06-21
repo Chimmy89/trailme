@@ -6,9 +6,8 @@ import { MapShell } from "@/map/MapShell";
 /**
  * Live control-room map. Requires an authenticated session and reads the user's
  * tenant + role from the session JWT `app_metadata` (stamped server-side by the
- * Custom Access Token Hook — see ARCHITECTURE.md M0). The interactive map itself
- * is a client component; this server boundary only enforces auth and hands the
- * verified identity context down.
+ * Custom Access Token Hook). The interactive map is a client component; this
+ * server boundary enforces auth and resolves the org name.
  */
 export default async function MapPage() {
   const supabase = await createClient();
@@ -25,7 +24,23 @@ export default async function MapPage() {
   const role = (appMetadata.role as Role | undefined) ?? null;
   const siteIds = (appMetadata.site_ids as string[] | undefined) ?? [];
 
+  let orgName: string | null = null;
+  if (orgId) {
+    const { data: org } = await supabase
+      .from("organizations")
+      .select("name")
+      .eq("id", orgId)
+      .maybeSingle();
+    orgName = org?.name ?? null;
+  }
+
   return (
-    <MapShell orgId={orgId} role={role} siteIds={siteIds} email={user.email} />
+    <MapShell
+      orgId={orgId}
+      orgName={orgName}
+      role={role}
+      siteIds={siteIds}
+      email={user.email}
+    />
   );
 }

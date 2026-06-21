@@ -11,8 +11,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@supabase/ssr": "^0.5",
-    "@supabase/supabase-js": "^2.45",
+    "@supabase/ssr": "^0.12.0",
+    "@supabase/supabase-js": "^2.108",
     "@trailme/db-types": "workspace:*",
     "@trailme/map-style": "workspace:*",
     "@trailme/shared": "workspace:*",

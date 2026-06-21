@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "1.23.1",
-    "@rnmapbox/maps": "^10.1.33",
+    "@rnmapbox/maps": "10.1.45",
     "@supabase/supabase-js": "^2.45.4",
     "@trailme/db-types": "workspace:*",
     "@trailme/map-style": "workspace:*",

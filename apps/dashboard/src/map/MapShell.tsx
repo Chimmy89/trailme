@@ -1,33 +1,54 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Map from "react-map-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { TIME_WINDOWS, type Role, type TimeWindow } from "@trailme/shared";
-// Layer style objects live in the shared map-style package so web and mobile
-// render identical colors/fade. Wired to live data in M4 — imported here so the
-// dependency and the contract are in place from M0.
-import { coverageHeatmapLayer, trailLineLayer } from "@trailme/map-style";
+import { createClient } from "@/lib/supabase/client";
+import { SignOutButton } from "@/components/SignOutButton";
 
-// Default map center until a site/org viewport is resolved (Oslo).
+// Default map center until live positions resolve a viewport (Oslo).
 const DEFAULT_CENTER = { longitude: 10.7522, latitude: 59.9139, zoom: 11 };
-
-// Reference the placeholder style objects so the import is load-bearing and the
-// contract surface stays visible. No layers are rendered until M4.
-void coverageHeatmapLayer;
-void trailLineLayer;
 
 type MapShellProps = {
   orgId: string | null;
+  orgName: string | null;
   role: Role | null;
   siteIds: string[];
   email?: string;
 };
 
-export function MapShell({ orgId, role, siteIds, email }: MapShellProps) {
+type Presence = { online: number; tracked: number };
+
+export function MapShell({ orgId, orgName, role, siteIds, email }: MapShellProps) {
   const [windowMinutes, setWindowMinutes] = useState<TimeWindow>(15);
+  const [presence, setPresence] = useState<Presence>({ online: 0, tracked: 0 });
 
   const mapboxToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
+
+  // Poll last-known positions. Postgres Realtime / the consolidated per-site
+  // broadcast (M3) replaces this; polling is enough for the first live surface.
+  useEffect(() => {
+    if (!orgId) return;
+    const supabase = createClient();
+    let active = true;
+
+    async function load() {
+      const { data } = await supabase.from("guard_positions").select("guard_id, online");
+      if (!active || !data) return;
+      setPresence({
+        online: data.filter((row) => row.online).length,
+        tracked: data.length,
+      });
+    }
+
+    void load();
+    const id = setInterval(load, 5000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, [orgId]);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100vh" }}>
@@ -69,11 +90,10 @@ export function MapShell({ orgId, role, siteIds, email }: MapShellProps) {
           backdropFilter: "blur(8px)",
           border: "1px solid var(--border)",
           borderRadius: "var(--radius)",
-          pointerEvents: "auto",
         }}
       >
         <div style={{ display: "flex", flexDirection: "column" }}>
-          <strong>TrailMe — Live</strong>
+          <strong>{orgName ?? "TrailMe"} — Live</strong>
           <span style={{ color: "var(--muted)", fontSize: "0.8125rem" }}>
             {email ?? "—"}
             {role ? ` · ${role}` : ""}
@@ -81,11 +101,42 @@ export function MapShell({ orgId, role, siteIds, email }: MapShellProps) {
           </span>
         </div>
 
-        <TimeWindowSelector value={windowMinutes} onChange={setWindowMinutes} />
+        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+          <TimeWindowSelector value={windowMinutes} onChange={setWindowMinutes} />
+          <a href="/admin/settings" style={{ color: "var(--muted)", fontSize: "0.8125rem" }}>
+            Admin
+          </a>
+          <SignOutButton />
+        </div>
       </header>
 
-      {/* orgId is plumbed through for the M3/M4 per-site Realtime subscriptions. */}
-      <span hidden data-org-id={orgId ?? ""} />
+      <footer
+        style={{
+          position: "absolute",
+          left: "1rem",
+          bottom: "1rem",
+          padding: "0.5rem 0.75rem",
+          background: "rgba(20, 25, 35, 0.85)",
+          backdropFilter: "blur(8px)",
+          border: "1px solid var(--border)",
+          borderRadius: "var(--radius)",
+          color: presence.tracked ? "var(--foreground)" : "var(--muted)",
+          fontSize: "0.8125rem",
+          maxWidth: "26rem",
+        }}
+      >
+        {presence.tracked ? (
+          <span>
+            <strong style={{ color: "var(--accent)" }}>{presence.online}</strong> online ·{" "}
+            {presence.tracked} tracked · last {windowMinutes}m
+          </span>
+        ) : (
+          <span>
+            No guards online yet — start the field app and clock in to see live positions and
+            trails here.
+          </span>
+        )}
+      </footer>
     </div>
   );
 }

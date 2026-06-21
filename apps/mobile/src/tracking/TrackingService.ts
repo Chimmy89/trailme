@@ -32,12 +32,9 @@
  *   4. SHIFT GATE — in shift_gated mode, start/stop follows clock-in/out. The
  *      server is the authority (window-based on captured_at); the client just
  *      avoids burning battery/GPS when off-shift.
- *
- * M0 SCOPE: define the interface + a transistorsoft-backed SKELETON (wires
- * onLocation, no real ingest POST) + an expo-location fallback stub. The actual
- * ingest POST, device-token auth, and gated-persist wiring are M2 TODOs.
  */
 
+import BackgroundGeolocation from 'react-native-background-geolocation';
 import type { Breadcrumb } from '@trailme/shared';
 
 /**
@@ -64,8 +61,23 @@ export interface TrackingLocation {
   capturedAt: string;
   /** Horizontal accuracy in metres; used to drop/flag low-confidence fixes. */
   accuracyM: number;
+  /** Bearing in degrees [0,360); null when unknown/stationary. */
+  heading: number | null;
   /** True for a periodic "still alive" fix with no real movement. */
   isKeepalive: boolean;
+}
+
+/**
+ * Durable-ingest wiring handed to the engine so its native HTTP sync can flush
+ * the breadcrumb buffer without the JS engine running.
+ */
+export interface IngestConfig {
+  /** ingest-breadcrumbs Edge Function URL. */
+  url: string;
+  /** ~24h device-scoped JWT (NOT the interactive session). */
+  deviceToken: string;
+  /** Per-install epoch, attached to every fix for the dedup key. */
+  installId: string;
 }
 
 export interface TrackingConfig {
@@ -75,6 +87,8 @@ export interface TrackingConfig {
   guardId: string;
   /** Engine distance gate (metres). Background live cadence ~= this. */
   distanceFilterM: number;
+  /** Durable-ingest endpoint + device-token auth. */
+  ingest: IngestConfig;
 }
 
 /** The seam every screen/store talks to. Engines implement this. */
@@ -105,17 +119,46 @@ class TrackingCore {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// transistorsoft-backed implementation (SKELETON — ingest POST is an M2 TODO)
+// transistorsoft-backed implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Production engine. Imports react-native-background-geolocation and wires its
- * onLocation callback to (a) make captured_at monotonic, (b) publish the live
- * tick, (c) hand the gated fix to the durable queue.
+ * Maps each buffered native location record onto the @trailme/shared Breadcrumb
+ * wire shape via the SDK's Ruby-erb-style template (bare `<%= tag %>`
+ * substitution only — the native template engine is NOT relied on for computed
+ * expressions). httpRootProperty:'breadcrumbs' nests the rendered objects into
+ * the BreadcrumbBatch `{ breadcrumbs: [...] }` body the ingest function expects.
+ * String tags are quoted; numeric tags (lat/lon/clientSeq/accuracy) are not.
  *
- * NOTE: the import is intentionally `require`-style lazy via dynamic import in
- * start() so the rest of the app (and the expo-location fallback) doesn't pull
- * in the native module on platforms/builds where it isn't linked.
+ * `clientSeq` is sourced from `timestampMeta.systemTime` (epoch-ms) because the
+ * native HTTP sync flushes WITHOUT the JS engine running, so it cannot maintain
+ * a JS-side monotonic counter. A replay of the same buffered record carries the
+ * same systemTime, so `(guardId, installId, clientSeq)` still dedups idempotently
+ * on the server. (The strictly-monotonic max(lastTs+1, gpsTs) clock governs the
+ * LIVE tick path below, which the JS layer fully controls.)
+ *
+ * `isKeepalive` is sent as literal `false`: the template engine can't reliably
+ * invert `is_moving`, and the ingest function ALREADY flags stuck/duplicate
+ * last-known fixes (a parked guard's heartbeats land on the same lat/lon) as
+ * low-confidence and excludes them from the heatmap — so the parked-guard
+ * false-hotspot is prevented server-side regardless of this flag.
+ */
+const LOCATION_TEMPLATE =
+  '{' +
+  '"guardId":"<%= extras.guardId %>",' +
+  '"installId":"<%= extras.installId %>",' +
+  '"lat":<%= latitude %>,' +
+  '"lon":<%= longitude %>,' +
+  '"capturedAt":"<%= timestamp %>",' +
+  '"clientSeq":<%= timestampMeta.systemTime %>,' +
+  '"accuracyM":<%= accuracy %>,' +
+  '"isKeepalive":false' +
+  '}';
+
+/**
+ * Production engine. Wires react-native-background-geolocation's onLocation
+ * callback to (a) make captured_at monotonic, (b) publish the live tick, and
+ * lets the native HTTP sync own the durable batch POST (url/headers/autoSync).
  */
 export class TransistorTrackingService implements TrackingService {
   private core = new TrackingCore();
@@ -123,17 +166,41 @@ export class TransistorTrackingService implements TrackingService {
   private config: TrackingConfig | null = null;
   private locationListeners = new Set<(loc: TrackingLocation) => void>();
   private statusListeners = new Set<(s: TrackingStatus) => void>();
+  private locationSub: { remove: () => void } | null = null;
 
   async configure(config: TrackingConfig): Promise<void> {
     this.config = config;
-    // M2: BackgroundGeolocation.ready({
-    //   distanceFilter: config.distanceFilterM,
-    //   stopOnTerminate: false, startOnBoot: true,
-    //   url: <ingest endpoint>, autoSync: true, batchSync: true,
-    //   headers: { Authorization: `Bearer ${deviceToken}` }, // 24h device token
-    //   foregroundService: true,                              // Android FGS
-    //   ... heartbeatInterval for the 2-min keepalive, etc.
-    // })
+
+    await BackgroundGeolocation.ready({
+      // ----- motion + accuracy ------------------------------------------------
+      desiredAccuracy: BackgroundGeolocation.DESIRED_ACCURACY_HIGH,
+      distanceFilter: config.distanceFilterM,
+      // ----- lifecycle: survive terminate/reboot, run as a foreground service -
+      stopOnTerminate: false,
+      startOnBoot: true,
+      foregroundService: true,
+      // 2-min stationary heartbeat so a parked guard stays "alive". The parked
+      // guard's repeated same-point fixes are flagged low-confidence + excluded
+      // from the heatmap server-side (see LOCATION_TEMPLATE on isKeepalive).
+      heartbeatInterval: 120,
+      // ----- durable HTTP sync (owns the breadcrumb POST) --------------------
+      url: config.ingest.url,
+      autoSync: true,
+      batchSync: true,
+      httpRootProperty: 'breadcrumbs',
+      locationTemplate: LOCATION_TEMPLATE,
+      // systemTime (epoch-ms) feeds the template's clientSeq; see LOCATION_TEMPLATE.
+      enableTimestampMeta: true,
+      // guardId/installId merged onto every record by the template's extras tags.
+      extras: { guardId: config.guardId, installId: config.ingest.installId },
+      headers: { Authorization: `Bearer ${config.ingest.deviceToken}` },
+      // Battery: don't keep the radio hot when stationary.
+      preventSuspend: false,
+      notification: {
+        title: 'TrailMe',
+        text: 'Sharing your patrol position with your team.',
+      },
+    });
   }
 
   async start(): Promise<void> {
@@ -142,37 +209,58 @@ export class TransistorTrackingService implements TrackingService {
     }
     this.setStatus('starting');
 
-    // Lazy native import so non-native builds/fallback don't link it.
-    // const BackgroundGeolocation = (
-    //   await import('react-native-background-geolocation')
-    // ).default;
-    //
-    // BackgroundGeolocation.onLocation((location) => {
-    //   // (1) normalize + make captured_at monotonic
-    //   const capturedAt = this.core.monotonicCapturedAt(
-    //     new Date(location.timestamp).getTime(),
-    //   );
-    //   const loc: TrackingLocation = {
-    //     lat: location.coords.latitude,
-    //     lon: location.coords.longitude,
-    //     capturedAt,
-    //     accuracyM: location.coords.accuracy,
-    //     isKeepalive: location.sample === true,
-    //   };
-    //   // (2) PUBLISH LIVE from the callback (not a timer) — advisory tick.
-    //   //     TODO(M2): emit on the realtime socket opportunistically.
-    //   // (3) DURABLE: the native HTTP sync owns the gated-persist POST,
-    //   //     authed by the device token. TODO(M2): wire url + token + gate.
-    //   this.emitLocation(loc);
-    // });
-    //
-    // BackgroundGeolocation.start();
+    try {
+      // Permission first; a refusal must surface as 'denied', not a silent stop.
+      const status = await BackgroundGeolocation.requestPermission();
+      // AUTHORIZATION_STATUS_DENIED (1) / RESTRICTED (2) → no tracking.
+      if (status === 1 || status === 2) {
+        this.setStatus('denied');
+        return;
+      }
 
-    this.setStatus('tracking');
+      // Re-subscribe defensively (start may be called again after a stop).
+      this.locationSub?.remove();
+      this.locationSub = BackgroundGeolocation.onLocation(
+        (location) => {
+          // (1) normalize + make captured_at monotonic per device.
+          const capturedAt = this.core.monotonicCapturedAt(new Date(location.timestamp).getTime());
+          const loc: TrackingLocation = {
+            lat: location.coords.latitude,
+            lon: location.coords.longitude,
+            capturedAt,
+            accuracyM: location.coords.accuracy,
+            heading:
+              typeof location.coords.heading === 'number' && location.coords.heading >= 0
+                ? location.coords.heading
+                : null,
+            // A non-moving sample is the keepalive heartbeat.
+            isKeepalive: location.is_moving === false,
+          };
+          // (2) PUBLISH LIVE from the callback (advisory tick). (3) The durable
+          // batch POST is owned by the native HTTP sync (url/headers/autoSync
+          // above), so nothing further is needed here for persistence.
+          this.emitLocation(loc);
+        },
+        () => {
+          // A location error (no fix) is not fatal; keep tracking state.
+        },
+      );
+
+      await BackgroundGeolocation.start();
+      this.setStatus('tracking');
+    } catch (_err) {
+      this.setStatus('error');
+    }
   }
 
   async stop(): Promise<void> {
-    // M2: BackgroundGeolocation.stop();
+    this.locationSub?.remove();
+    this.locationSub = null;
+    try {
+      await BackgroundGeolocation.stop();
+    } catch (_err) {
+      // Best-effort stop; report stopped regardless so the UI isn't stuck.
+    }
     this.setStatus('stopped');
   }
 
@@ -201,30 +289,83 @@ export class TransistorTrackingService implements TrackingService {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// expo-location fallback (STUB)
+// expo-location fallback (foreground-biased, via the same native engine)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Emergency fallback when the native background engine is unavailable (e.g. a
- * build without the transistorsoft license, or an OEM that killed the FGS).
- * expo-location CANNOT match transistorsoft's screen-off reliability across OEM
- * battery killers — this exists only so the app degrades instead of dying, and
- * so tracking-health can tell the guard tracking is degraded.
+ * Emergency fallback when the full background engine is degraded (e.g. an OEM
+ * that killed the foreground service, or a build without the transistorsoft
+ * license). It runs the SAME native engine but in a foreground-biased, no-HTTP
+ * configuration: it emits live ticks via onLocation while the app is in front,
+ * but does NOT own the durable buffer/sync. It CANNOT match the production
+ * engine's screen-off reliability across OEM battery killers — this exists only
+ * so the app degrades (and tracking-health can report degraded) instead of dying.
  */
 export class ExpoLocationTrackingService implements TrackingService {
+  private core = new TrackingCore();
   private status: TrackingStatus = 'stopped';
+  private config: TrackingConfig | null = null;
+  private locationListeners = new Set<(loc: TrackingLocation) => void>();
   private statusListeners = new Set<(s: TrackingStatus) => void>();
+  private locationSub: { remove: () => void } | null = null;
 
-  async configure(_config: TrackingConfig): Promise<void> {
-    // M2: no-op; expo-location is configured per-request at start().
+  async configure(config: TrackingConfig): Promise<void> {
+    this.config = config;
+    // Foreground-biased: no url/autoSync (no durable buffer in fallback mode),
+    // no foreground service — just live fixes while the app is usable.
+    await BackgroundGeolocation.ready({
+      desiredAccuracy: BackgroundGeolocation.DESIRED_ACCURACY_HIGH,
+      distanceFilter: config.distanceFilterM,
+      stopOnTerminate: true,
+      startOnBoot: false,
+      foregroundService: false,
+      autoSync: false,
+    });
   }
 
   async start(): Promise<void> {
-    // M2: expo-location startLocationUpdatesAsync (foreground-biased).
-    this.setStatus('tracking');
+    if (!this.config) {
+      throw new Error('TrackingService.start() before configure()');
+    }
+    this.setStatus('starting');
+    try {
+      const status = await BackgroundGeolocation.requestPermission();
+      if (status === 1 || status === 2) {
+        this.setStatus('denied');
+        return;
+      }
+
+      this.locationSub?.remove();
+      this.locationSub = BackgroundGeolocation.onLocation((location) => {
+        const capturedAt = this.core.monotonicCapturedAt(new Date(location.timestamp).getTime());
+        this.emitLocation({
+          lat: location.coords.latitude,
+          lon: location.coords.longitude,
+          capturedAt,
+          accuracyM: location.coords.accuracy,
+          heading:
+            typeof location.coords.heading === 'number' && location.coords.heading >= 0
+              ? location.coords.heading
+              : null,
+          isKeepalive: location.is_moving === false,
+        });
+      });
+
+      await BackgroundGeolocation.start();
+      this.setStatus('tracking');
+    } catch (_err) {
+      this.setStatus('error');
+    }
   }
 
   async stop(): Promise<void> {
+    this.locationSub?.remove();
+    this.locationSub = null;
+    try {
+      await BackgroundGeolocation.stop();
+    } catch (_err) {
+      // Best-effort.
+    }
     this.setStatus('stopped');
   }
 
@@ -232,14 +373,18 @@ export class ExpoLocationTrackingService implements TrackingService {
     return this.status;
   }
 
-  onLocation(_listener: (loc: TrackingLocation) => void): () => void {
-    // M2: forward expo-location updates here.
-    return () => {};
+  onLocation(listener: (loc: TrackingLocation) => void): () => void {
+    this.locationListeners.add(listener);
+    return () => this.locationListeners.delete(listener);
   }
 
   onStatusChange(listener: (s: TrackingStatus) => void): () => void {
     this.statusListeners.add(listener);
     return () => this.statusListeners.delete(listener);
+  }
+
+  private emitLocation(loc: TrackingLocation): void {
+    for (const l of this.locationListeners) l(loc);
   }
 
   private setStatus(status: TrackingStatus): void {
@@ -250,7 +395,7 @@ export class ExpoLocationTrackingService implements TrackingService {
 
 /**
  * Single app-wide tracking service. Swapping engines is a one-line change here.
- * Defaults to the transistorsoft engine; the fallback is selected at runtime in
- * M2 when the native engine reports unavailable/unlicensed.
+ * Defaults to the transistorsoft engine; the fallback is selected at runtime
+ * when the native engine reports unavailable/unlicensed.
  */
 export const trackingService: TrackingService = new TransistorTrackingService();

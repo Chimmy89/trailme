@@ -4,8 +4,21 @@
     "strict": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"]
-    }
+      "@/*": ["./src/*"],
+      // Pin the React typings to this app's own copy (React 18 / RN 0.76).
+      // pnpm hoists @types/react@19 (the dashboard's, for React 19) into the
+      // workspace virtual store, and tsc would otherwise auto-include it as the
+      // ambient React global — producing the spurious "bigint is not assignable
+      // to ReactNode" / "X cannot be used as a JSX component" errors. These
+      // mappings force every `react` / `@types/react` resolution to the 18.3.x
+      // copy linked under this app's node_modules.
+      "react": ["./node_modules/@types/react"],
+      "react/*": ["./node_modules/@types/react/*"],
+      "@types/react": ["./node_modules/@types/react"]
+    },
+    // Bound automatic @types inclusion to this app's own node_modules so the
+    // hoisted root @types/react@19 is never pulled in as an ambient global.
+    "typeRoots": ["./node_modules/@types"]
   },
   "include": [
     "**/*.ts",

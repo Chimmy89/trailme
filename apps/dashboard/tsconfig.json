@@ -32,7 +32,10 @@
       ],
       "@trailme/db-types": [
         "../../packages/db-types/src"
-      ]
+      ],
+      "react": ["./node_modules/@types/react"],
+      "react/*": ["./node_modules/@types/react/*"],
+      "@types/react": ["./node_modules/@types/react"]
     },
     "allowJs": true
   },

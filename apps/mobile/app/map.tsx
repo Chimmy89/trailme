@@ -1,47 +1,80 @@
-import Mapbox, { Camera, MapView } from '@rnmapbox/maps';
+import Mapbox, { Camera, CircleLayer, LineLayer, MapView, ShapeSource } from '@rnmapbox/maps';
 import { Link } from 'expo-router';
-import { useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { useMemo, useState } from 'react';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 
+import {
+  SOURCE_IDS,
+  guardColor,
+  liveMarkerCircleLayer,
+  trailLineLayer,
+  trailSourceId,
+} from '@trailme/map-style';
 import { TIME_WINDOWS, type TimeWindow } from '@trailme/shared';
+
+import { usePeers, type Peer } from '@/map/usePeers';
+import { toRNMapboxStyle } from '@/map/style-adapter';
 
 // Native Mapbox needs its access token set once, before any MapView mounts.
 // (Web/GL-JS reads the token per-component; native reads it from this global.)
 Mapbox.setAccessToken(process.env.EXPO_PUBLIC_MAPBOX_TOKEN ?? '');
 
 /**
- * Live map (M0 shell).
+ * Live map.
  *
- * Renders the base Mapbox map + the shared time-window selector. The trail /
- * heatmap / peer-marker layers from @trailme/map-style are wired in M3–M4 once
- * the realtime + trail_window paths exist. The mobile renderer is deliberately
- * capped tighter than the dashboard: SAME-SITE peers only, shorter default
- * window, bounded concurrent line layers (see ARCHITECTURE.md mobile-render
- * cap). No peer data is fetched yet.
+ * Renders the base Mapbox map, same-site peer markers seeded from
+ * `trail_window` and updated by the per-site live broadcast, and a basic
+ * per-guard trail line. The mobile renderer is deliberately capped tighter than
+ * the dashboard: SAME-SITE peers only, shorter default window, one line layer
+ * per peer (see ARCHITECTURE.md mobile-render cap). The window selector re-runs
+ * `trail_window`.
  */
 export default function MapScreen() {
   // 15 min is the mobile-friendly default (shorter than the dashboard).
   const [windowMin, setWindowMin] = useState<TimeWindow>(15);
+  const { peers, loading, error } = usePeers(windowMin);
+
+  // One FeatureCollection of live markers; the shared circle layer reads color
+  // and online from feature properties.
+  const liveFeatures = useMemo(
+    () => ({
+      type: 'FeatureCollection' as const,
+      features: peers.map((p) => ({
+        type: 'Feature' as const,
+        geometry: { type: 'Point' as const, coordinates: [p.lon, p.lat] },
+        properties: { color: guardColor(p.guardId), online: p.online },
+      })),
+    }),
+    [peers],
+  );
+
+  const circleStyle = useMemo(() => toRNMapboxStyle(liveMarkerCircleLayer()), []);
+
+  // Center on the first peer if present, else Oslo placeholder.
+  const center = peers[0] ? [peers[0].lon, peers[0].lat] : [10.7522, 59.9139];
 
   return (
     <View style={styles.container}>
       <MapView style={styles.map} styleURL={Mapbox.StyleURL.Dark}>
-        <Camera
-          zoomLevel={14}
-          // Oslo placeholder until we center on the guard's own position (M2).
-          centerCoordinate={[10.7522, 59.9139]}
-        />
-        {/*
-          M3/M4: <ShapeSource> + <LineLayer>/<HeatmapLayer> whose paint/layout
-          come from @trailme/map-style (trailLineLayer / coverageHeatmapLayer /
-          liveMarkerCircleLayer), one source per same-site peer, window-trimmed
-          client-side off `windowMin`. Intentionally unwired in M0 — no peer
-          data and the GL-spec→rnmapbox flattening is M4 work.
-        */}
+        <Camera zoomLevel={14} centerCoordinate={center} />
+
+        {/* Per-guard trail: one source + line layer per peer (line-gradient
+            can't be filtered per-feature, so trails are not merged). */}
+        {peers.map((p) => (
+          <PeerTrail key={p.guardId} peer={p} />
+        ))}
+
+        {/* Live markers: one shared source + the shared circle layer. */}
+        <ShapeSource id={SOURCE_IDS.LIVE_POSITIONS} shape={liveFeatures}>
+          <CircleLayer id="trailme-live-marker-circle" style={circleStyle} />
+        </ShapeSource>
       </MapView>
 
       <View style={styles.windowBar}>
-        <Text style={styles.windowLabel}>Window</Text>
+        <View style={styles.windowHeader}>
+          <Text style={styles.windowLabel}>Window</Text>
+          {loading ? <ActivityIndicator size="small" color="#9ca3af" /> : null}
+        </View>
         <View style={styles.windowOptions}>
           {TIME_WINDOWS.map((min) => {
             const active = min === windowMin;
@@ -51,13 +84,12 @@ export default function MapScreen() {
                 onPress={() => setWindowMin(min)}
                 style={[styles.chip, active && styles.chipActive]}
               >
-                <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                  {min}m
-                </Text>
+                <Text style={[styles.chipText, active && styles.chipTextActive]}>{min}m</Text>
               </Pressable>
             );
           })}
         </View>
+        {error ? <Text style={styles.error}>{error}</Text> : null}
       </View>
 
       <View style={styles.actions}>
@@ -81,6 +113,36 @@ export default function MapScreen() {
   );
 }
 
+/** A single peer's trail as a LineString styled with the shared trail layer. */
+function PeerTrail({ peer }: { peer: Peer }) {
+  const color = guardColor(peer.guardId);
+  const shape = useMemo(
+    () => ({
+      type: 'Feature' as const,
+      properties: {},
+      geometry: {
+        type: 'LineString' as const,
+        // newest-LAST so the line-gradient (line-progress) fades correctly.
+        coordinates: peer.trail.map((pt) => [pt.lon, pt.lat]),
+      },
+    }),
+    [peer.trail],
+  );
+  const lineStyle = useMemo(
+    () => toRNMapboxStyle(trailLineLayer(peer.guardId, color)),
+    [peer.guardId, color],
+  );
+
+  // A trail needs >= 2 points to draw a line.
+  if (peer.trail.length < 2) return null;
+
+  return (
+    <ShapeSource id={trailSourceId(peer.guardId)} shape={shape} lineMetrics>
+      <LineLayer id={`trailme-trail-line-${peer.guardId}`} style={lineStyle} />
+    </ShapeSource>
+  );
+}
+
 const styles = StyleSheet.create({
   container: { flex: 1 },
   map: { flex: 1 },
@@ -93,6 +155,11 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 10,
     gap: 6,
+  },
+  windowHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
   windowLabel: {
     color: '#9ca3af',
@@ -111,6 +178,7 @@ const styles = StyleSheet.create({
   chipActive: { backgroundColor: '#1d4ed8' },
   chipText: { color: '#cbd5e1', fontSize: 13, fontWeight: '600' },
   chipTextActive: { color: '#fff' },
+  error: { color: '#fca5a5', fontSize: 12 },
   actions: {
     position: 'absolute',
     bottom: 24,

@@ -22,7 +22,7 @@ port = 54322
 shadow_port = 54320
 # Pinned to Postgres 15: PG15 enables `CREATE VIEW ... WITH (security_invoker = true)`,
 # which the dashboard views rely on (see ARCHITECTURE.md). Must match the remote DB.
-major_version = 15
+major_version = 17
 
 [db.migrations]
 enabled = true

@@ -2,6 +2,10 @@
 node_modules/
 .pnpm-store/
 
+# Foreign lockfiles — this is a pnpm workspace; npm/yarn lockfiles must not land here
+package-lock.json
+yarn.lock
+
 # Build output
 dist/
 .next/

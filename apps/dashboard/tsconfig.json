@@ -1,20 +1,40 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["dom", "dom.iterable", "esnext"],
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
     "jsx": "preserve",
     "module": "esnext",
     "moduleResolution": "bundler",
     "noEmit": true,
     "incremental": true,
-    "plugins": [{ "name": "next" }],
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"],
-      "@trailme/shared": ["../../packages/shared/src"],
-      "@trailme/map-style": ["../../packages/map-style/src"],
-      "@trailme/supabase-client": ["../../packages/supabase-client/src"],
-      "@trailme/db-types": ["../../packages/db-types/src"]
-    }
+      "@/*": [
+        "./src/*"
+      ],
+      "@trailme/shared": [
+        "../../packages/shared/src"
+      ],
+      "@trailme/map-style": [
+        "../../packages/map-style/src"
+      ],
+      "@trailme/supabase-client": [
+        "../../packages/supabase-client/src"
+      ],
+      "@trailme/db-types": [
+        "../../packages/db-types/src"
+      ]
+    },
+    "allowJs": true
   },
   "include": [
     "next-env.d.ts",
@@ -22,5 +42,7 @@
     "**/*.tsx",
     ".next/types/**/*.ts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules"
+  ]
 }

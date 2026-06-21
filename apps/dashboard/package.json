@@ -1,0 +1,35 @@
+{
+  "name": "@trailme/dashboard",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.5",
+    "@supabase/supabase-js": "^2.45",
+    "@trailme/db-types": "workspace:*",
+    "@trailme/map-style": "workspace:*",
+    "@trailme/shared": "workspace:*",
+    "@trailme/supabase-client": "workspace:*",
+    "mapbox-gl": "^3.6",
+    "next": "^15",
+    "react": "^19",
+    "react-dom": "^19",
+    "react-map-gl": "^7.1"
+  },
+  "devDependencies": {
+    "@types/mapbox-gl": "^3.4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "^15",
+    "typescript": "^5.5"
+  }
+}

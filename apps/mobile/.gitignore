@@ -1,0 +1,17 @@
+# Expo / native build artifacts (config plugins generate android/ & ios/).
+.expo/
+dist/
+android/
+ios/
+web-build/
+
+# Env + secrets (use EAS Secrets for native build tokens).
+.env
+.env.local
+
+# Metro / RN
+*.log
+node_modules/
+
+# macOS
+.DS_Store

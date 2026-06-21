@@ -1,0 +1,98 @@
+# TrailMe — Supabase project configuration (M0: tenancy spine + RLS + auth hook).
+#
+# Reference: https://supabase.com/docs/guides/local-development/cli/config
+#
+# DATA RESIDENCY (GDPR): the HOSTED project MUST be provisioned in an EU region
+# (e.g. eu-central-1 / eu-north-1) for Norwegian customers — see docs/GDPR.md.
+# Region is chosen at `supabase projects create` / dashboard time, NOT in this file;
+# this comment is the canonical reminder so it is never provisioned outside the EU.
+project_id = "trailme"
+
+[api]
+enabled = true
+port = 54321
+# Only `public` is exposed via the Data API. The private `authz` schema (SECURITY
+# DEFINER helpers + the auth hook's dependencies) is deliberately NOT exposed.
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+# Pinned to Postgres 15: PG15 enables `CREATE VIEW ... WITH (security_invoker = true)`,
+# which the dashboard views rely on (see ARCHITECTURE.md). Must match the remote DB.
+major_version = 15
+
+[db.migrations]
+enabled = true
+
+[db.seed]
+# Seeds one org / settings / site / two users (org_admin + guard) so the M0 login
+# test has data. Runs after migrations on `supabase db reset`.
+enabled = true
+sql_paths = ["./seed.sql"]
+
+[realtime]
+# Required from M3 (per-site live position channels "site:{siteId}"). Enabled now so
+# the channel-authz wiring lands on a realtime-capable stack from the start.
+enabled = true
+
+[studio]
+enabled = true
+port = 54323
+
+[inbucket]
+# Local email capture — M0 email/password signups land here for inspection.
+enabled = true
+port = 54324
+
+[auth]
+enabled = true
+# Dashboard (Next.js) origin. The mobile app authenticates via the same GoTrue
+# instance using the Expo deep-link scheme.
+site_url = "http://127.0.0.1:3000"
+additional_redirect_urls = ["http://127.0.0.1:3000", "trailme://auth-callback"]
+# 1h interactive access token (fast revocation of reads/realtime on offboarding).
+# The 24h device-ingest token (M1) is a SEPARATE, independently-revocable JWT.
+jwt_expiry = 3600
+enable_refresh_token_rotation = true
+refresh_token_reuse_interval = 10
+# MVP onboarding is invite/join-code driven (M5); open signup stays off.
+enable_signup = false
+
+[auth.email]
+# Email/password is the M0 auth method for both apps.
+enable_signup = true
+# Local dev confirms via Inbucket; production flips this on (see GDPR.md).
+enable_confirmations = false
+minimum_password_length = 8
+
+# Custom Access Token Hook — stamps app_metadata.org_id / role / site_ids from the
+# memberships table on every token issuance. Defined in migration 0004 as
+# public.custom_access_token_hook(jsonb). The hook is NULL-SAFE and FAILS CLOSED:
+# on any error it raises, which locks out the login rather than granting stale or
+# elevated claims. See 0004_access_token_hook.sql for the never-elevates invariant.
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/custom_access_token_hook"
+
+[edge_runtime]
+enabled = true
+policy = "per_worker"
+deno_version = 2
+
+# Edge function secrets are injected at deploy time, not committed. Canonical names
+# (see each function's header): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DEVICE_TOKEN_SECRET.
+[functions.ingest-breadcrumbs]
+# M1: validates the device-ingest token, preserves true captured_at, accuracy-filters,
+# returns a per-batch accepted/rejected report, calls the batch-insert RPC. (M0 stub: 501.)
+enabled = true
+
+[functions.mint-device-token]
+# M1: issues the ~24h device-scoped ingest JWT after interactive auth. (M0 stub: 501.)
+enabled = true
+
+[functions.relay-positions]
+# M3: consolidates per-site live ticks into ONE server-stamped broadcast. (M0 stub: 501.)
+enabled = true

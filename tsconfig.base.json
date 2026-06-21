@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "TrailMe base",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "moduleDetection": "force",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+
+    "baseUrl": ".",
+    "paths": {
+      "@trailme/shared": ["./packages/shared/src"],
+      "@trailme/shared/*": ["./packages/shared/src/*"],
+      "@trailme/map-style": ["./packages/map-style/src"],
+      "@trailme/map-style/*": ["./packages/map-style/src/*"],
+      "@trailme/supabase-client": ["./packages/supabase-client/src"],
+      "@trailme/supabase-client/*": ["./packages/supabase-client/src/*"],
+      "@trailme/db-types": ["./packages/db-types/src"],
+      "@trailme/db-types/*": ["./packages/db-types/src/*"]
+    }
+  },
+  "exclude": ["node_modules", "dist", ".next", ".expo", ".turbo"]
+}

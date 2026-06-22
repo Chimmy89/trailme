@@ -134,12 +134,12 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
         const now = Date.now();
         if (now - lastPush.current < 2500) return; // throttle pushes
         lastPush.current = now;
-        void supabase
-          .rpc("demo_push_position", { p_lat: latitude, p_lon: longitude })
-          .then(({ error }) => {
+        void supabase.rpc("demo_push_position", { p_lat: latitude, p_lon: longitude }).then(
+          ({ error }) => {
             if (error) setShareError(`Push: ${error.message}`);
-          })
-          .catch((e: unknown) => setShareError(`Push failed: ${e instanceof Error ? e.message : String(e)}`));
+          },
+          (e: unknown) => setShareError(`Push failed: ${e instanceof Error ? e.message : String(e)}`),
+        );
       },
       (err) => {
         setShareError(err.message || "Location permission denied.");
@@ -201,15 +201,16 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       const last = g.pts[g.pts.length - 1];
       if (last) coords.push([last.lon, last.lat]);
     }
-    if (coords.length === 0) return;
+    const first = coords[0];
+    if (!first) return;
     if (coords.length === 1) {
-      mapRef.current?.flyTo({ center: coords[0], zoom: PROPERTY_ZOOM });
+      mapRef.current?.flyTo({ center: first, zoom: PROPERTY_ZOOM });
       return;
     }
-    let minLng = coords[0][0],
-      maxLng = coords[0][0],
-      minLat = coords[0][1],
-      maxLat = coords[0][1];
+    let minLng = first[0],
+      maxLng = first[0],
+      minLat = first[1],
+      maxLat = first[1];
     for (const [lng, lat] of coords) {
       minLng = Math.min(minLng, lng);
       maxLng = Math.max(maxLng, lng);

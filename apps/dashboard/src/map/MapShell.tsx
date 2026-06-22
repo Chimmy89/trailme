@@ -20,6 +20,13 @@ const FIT_MAX_ZOOM = 19;
 // blends into the org roster colours.
 const YOU_COLOR = "#38bdf8";
 
+// Drop coarse fixes (Wi-Fi/cell locate, often hundreds of metres off) so the
+// first network fix doesn't shoot a line across the map and the dot lands on the
+// real spot — only GPS-grade fixes (≤ this many metres of reported accuracy).
+const ACCURACY_GATE_M = 50;
+// Ignore sub-jitter steps so a standing phone doesn't smear the trail into a blob.
+const MIN_MOVE_M = 4;
+
 const MAP_STYLES = {
   satellite: "mapbox://styles/mapbox/satellite-streets-v12",
   streets: "mapbox://styles/mapbox/streets-v12",
@@ -164,9 +171,13 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
 
     watchId.current = navigator.geolocation.watchPosition(
       (pos) => {
-        const { latitude, longitude } = pos.coords;
+        const { latitude, longitude, accuracy } = pos.coords;
 
-        // First successful fix: leave the "locating" state and cancel the watchdog.
+        // Ignore coarse (non-GPS) fixes entirely — they're what make the trail
+        // jump across the map and the dot land a block away.
+        if (accuracy != null && accuracy > ACCURACY_GATE_M) return;
+
+        // First accurate fix: leave the "locating" state and cancel the watchdog.
         if (!firstFixRef.current) {
           firstFixRef.current = true;
           setLocating(false);
@@ -176,13 +187,20 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           }
         }
 
-        // Show yourself immediately, regardless of the DB round-trip.
-        setMyTrail((prev) => [...prev, { lng: longitude, lat: latitude, t: Date.now() }]);
-
         if (!centeredOnce.current) {
           centeredOnce.current = true;
           mapRef.current?.flyTo({ center: [longitude, latitude], zoom: PROPERTY_ZOOM });
         }
+
+        // Show yourself immediately, regardless of the DB round-trip — but skip
+        // sub-jitter steps so a stationary phone doesn't smear the line.
+        setMyTrail((prev) => {
+          const last = prev[prev.length - 1];
+          if (last && metersBetween(last.lng, last.lat, longitude, latitude) < MIN_MOVE_M) {
+            return prev;
+          }
+          return [...prev, { lng: longitude, lat: latitude, t: Date.now() }];
+        });
 
         const now = Date.now();
         if (now - lastPush.current < 2500) return; // throttle pushes
@@ -446,6 +464,18 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       </footer>
     </div>
   );
+}
+
+// Great-circle distance in metres between two lon/lat points (haversine).
+function metersBetween(aLng: number, aLat: number, bLng: number, bLat: number): number {
+  const R = 6371000;
+  const dLat = ((bLat - aLat) * Math.PI) / 180;
+  const dLng = ((bLng - aLng) * Math.PI) / 180;
+  const lat1 = (aLat * Math.PI) / 180;
+  const lat2 = (bLat * Math.PI) / 180;
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
 
 // Turn a raw GeolocationPositionError into an actionable, retry-oriented message

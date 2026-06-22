@@ -24,14 +24,11 @@ const YOU_COLOR = "#38bdf8";
 // first network fix doesn't shoot a line across the map and the dot lands on the
 // real spot — only GPS-grade fixes (≤ this many metres of reported accuracy).
 const ACCURACY_GATE_M = 50;
-// Live-dot smoothing: exponential moving-average weight per new fix. Low enough
-// to damp the few-metre GPS jitter while you're still, high enough to follow you
-// when you walk. Lower = steadier but laggier; higher = snappier but jumpier.
-const SMOOTH_ALPHA = 0.3;
-// Minimum move (of the smoothed position) before adding a trail vertex — keeps
-// the line clean and stops it smearing while stationary, independent of how
-// responsively the dot itself tracks.
-const TRAIL_MIN_M = 4;
+// Hold the live dot rock-steady until a fix moves at least this far — above the
+// GPS jitter floor — then snap it to the new position. Fixed, NOT scaled by
+// reported accuracy: scaling let a momentary accuracy spike balloon the
+// threshold and block real movement (the dot looked stuck).
+const MOVE_FLOOR_M = 8;
 
 const MAP_STYLES = {
   satellite: "mapbox://styles/mapbox/satellite-streets-v12",
@@ -209,30 +206,19 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
 
         setAccuracyM(accuracy ?? null);
 
-        // Smooth the live dot with an exponential moving average: it damps the
-        // few-metre GPS jitter while you're still, yet follows you immediately
-        // when you walk (it updates on every fix, unlike a hard deadband).
+        // Hold the dot rock-steady until you move past the GPS jitter, then snap
+        // it to the new fix and drop a trail point there. (Averaging was tried
+        // and wandered; a fixed hold-and-snap stays put when you're standing.)
         const prevPos = displayRef.current;
-        const smoothed: TrailFix = prevPos
-          ? {
-              lng: prevPos.lng + SMOOTH_ALPHA * (longitude - prevPos.lng),
-              lat: prevPos.lat + SMOOTH_ALPHA * (latitude - prevPos.lat),
-              t: Date.now(),
-            }
-          : { lng: longitude, lat: latitude, t: Date.now() };
-        displayRef.current = smoothed;
-        setDisplayPos(smoothed);
-
-        // Grow the trail from the smoothed point, but only every few metres so
-        // the line stays clean and never smears while you're standing still.
-        setMyTrail((prev) => {
-          const last = prev[prev.length - 1];
-          if (!last) return [smoothed];
-          if (metersBetween(last.lng, last.lat, smoothed.lng, smoothed.lat) < TRAIL_MIN_M) {
-            return prev;
-          }
-          return [...prev, smoothed];
-        });
+        const moved =
+          prevPos == null ||
+          metersBetween(prevPos.lng, prevPos.lat, longitude, latitude) >= MOVE_FLOOR_M;
+        if (moved) {
+          const next: TrailFix = { lng: longitude, lat: latitude, t: Date.now() };
+          displayRef.current = next;
+          setDisplayPos(next);
+          setMyTrail((prev) => [...prev, next]);
+        }
 
         const now = Date.now();
         if (now - lastPush.current < 2500) return; // throttle pushes

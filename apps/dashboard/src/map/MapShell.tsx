@@ -24,6 +24,10 @@ const YOU_COLOR = "#38bdf8";
 // first network fix doesn't shoot a line across the map and the dot lands on the
 // real spot — only GPS-grade fixes (≤ this many metres of reported accuracy).
 const ACCURACY_GATE_M = 50;
+// Hold the live dot/trail in place unless a fix moves at least this far — above
+// the GPS noise floor — so a stationary phone stops drifting. Raised toward the
+// reported accuracy when GPS is poor, so noisier fixes need a bigger real move.
+const MOVE_FLOOR_M = 8;
 
 const MAP_STYLES = {
   satellite: "mapbox://styles/mapbox/satellite-streets-v12",
@@ -194,9 +198,16 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
 
         setAccuracyM(accuracy ?? null);
 
-        // Append every accurate fix so the dot tracks you and the trail builds as
-        // you move (the accuracy gate above already drops the wild network fixes).
-        setMyTrail((prev) => [...prev, { lng: longitude, lat: latitude, t: Date.now() }]);
+        // Append the fix, but only once it clears the GPS noise floor — so the
+        // dot/trail track real movement yet hold steady when you're standing
+        // still (jitter at this accuracy is a few metres per fix).
+        setMyTrail((prev) => {
+          const last = prev[prev.length - 1];
+          if (!last) return [{ lng: longitude, lat: latitude, t: Date.now() }];
+          const floor = Math.max(MOVE_FLOOR_M, accuracy ?? 0);
+          if (metersBetween(last.lng, last.lat, longitude, latitude) < floor) return prev;
+          return [...prev, { lng: longitude, lat: latitude, t: Date.now() }];
+        });
 
         const now = Date.now();
         if (now - lastPush.current < 2500) return; // throttle pushes
@@ -460,6 +471,18 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       </footer>
     </div>
   );
+}
+
+// Great-circle distance in metres between two lon/lat points (haversine).
+function metersBetween(aLng: number, aLat: number, bLng: number, bLat: number): number {
+  const R = 6371000;
+  const dLat = ((bLat - aLat) * Math.PI) / 180;
+  const dLng = ((bLng - aLng) * Math.PI) / 180;
+  const lat1 = (aLat * Math.PI) / 180;
+  const lat2 = (bLat * Math.PI) / 180;
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
 
 // Turn a raw GeolocationPositionError into an actionable, retry-oriented message

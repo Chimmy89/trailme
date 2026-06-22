@@ -22,7 +22,6 @@ export default async function MapPage() {
   const appMetadata = user.app_metadata ?? {};
   const orgId = (appMetadata.org_id as string | undefined) ?? null;
   const role = (appMetadata.role as Role | undefined) ?? null;
-  const siteIds = (appMetadata.site_ids as string[] | undefined) ?? [];
 
   let orgName: string | null = null;
   if (orgId) {
@@ -39,7 +38,6 @@ export default async function MapPage() {
       orgId={orgId}
       orgName={orgName}
       role={role}
-      siteIds={siteIds}
       email={user.email}
     />
   );

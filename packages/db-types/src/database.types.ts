@@ -1477,6 +1477,54 @@ export type Database = {
         }
         Relationships: []
       }
+      location_breadcrumbs_20260701: {
+        Row: {
+          accuracy_m: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id: string
+          ingested_at: string
+          install_id: string
+          is_keepalive: boolean
+          is_low_confidence: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Insert: {
+          accuracy_m?: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id?: string
+          ingested_at?: string
+          install_id: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Update: {
+          accuracy_m?: number | null
+          captured_at?: string
+          client_seq?: number
+          geom?: unknown
+          guard_id?: string
+          id?: string
+          ingested_at?: string
+          install_id?: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id?: string
+          partition_ts?: string
+          site_id?: string
+        }
+        Relationships: []
+      }
       location_breadcrumbs_default: {
         Row: {
           accuracy_m: number | null
@@ -1739,6 +1787,21 @@ export type Database = {
       clock_in: { Args: { p_at?: string; p_site: string }; Returns: string }
       clock_out: { Args: { p_at?: string }; Returns: string }
       custom_access_token_hook: { Args: { event: Json }; Returns: Json }
+      demo_live_map: {
+        Args: { p_minutes?: number }
+        Returns: {
+          captured_at: string
+          color: string
+          display_name: string
+          guard_id: string
+          lat: number
+          lon: number
+        }[]
+      }
+      demo_push_position: {
+        Args: { p_lat: number; p_lon: number }
+        Returns: undefined
+      }
       drop_aged_partitions: {
         Args: { p_global_max_days?: number }
         Returns: number

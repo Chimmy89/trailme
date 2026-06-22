@@ -130,7 +130,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   );
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100vh" }}>
+    <div style={{ position: "relative", width: "100%", height: "100dvh" }}>
       {mapboxToken ? (
         <MapGL
           ref={mapRef}
@@ -196,7 +196,8 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          gap: "1rem",
+          gap: "0.75rem",
+          flexWrap: "wrap",
           padding: "0.625rem 0.875rem",
           background: "rgba(20, 25, 35, 0.85)",
           backdropFilter: "blur(8px)",
@@ -213,7 +214,15 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           </span>
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "0.75rem",
+            flexWrap: "wrap",
+            justifyContent: "flex-end",
+          }}
+        >
           <TimeWindowSelector value={windowMinutes} onChange={setWindowMinutes} />
           <button
             type="button"
@@ -272,7 +281,7 @@ function TimeWindowSelector({
   onChange: (next: TimeWindow) => void;
 }) {
   return (
-    <div role="group" aria-label="Coverage time window (minutes)" style={{ display: "flex", gap: "0.25rem" }}>
+    <div role="group" aria-label="Coverage time window (minutes)" style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap" }}>
       {TIME_WINDOWS.map((minutes) => {
         const active = minutes === value;
         return (

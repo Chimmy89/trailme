@@ -56,11 +56,19 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   // The viewer's own GPS fixes, kept client-side so you see yourself + your
   // trail instantly — no dependency on the demo_live_map round-trip.
   const [myTrail, setMyTrail] = useState<TrailFix[]>([]);
+  // Distinguish "asked for location, no fix yet" from "actively sharing" so the
+  // button + footer don't lie during the fragile first-fix window.
+  const [locating, setLocating] = useState(false);
+  // Mobile browsers suspend watchPosition when the tab is hidden / screen locks;
+  // surface that instead of leaving a frozen dot that looks live.
+  const [hidden, setHidden] = useState(false);
 
   const mapRef = useRef<MapRef | null>(null);
   const watchId = useRef<number | null>(null);
   const lastPush = useRef<number>(0);
   const centeredOnce = useRef(false);
+  const firstFixRef = useRef(false);
+  const awaitTimer = useRef<number | null>(null);
 
   const supabase = useMemo(() => createClient(), []);
   const mapboxToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
@@ -91,25 +99,46 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       if (data) setPoints(data as LivePoint[]);
     }
     void load();
-    const id = setInterval(load, 3000);
+    // ~1.5s keeps peer dots/trails feeling live (the demo stand-in for the
+    // unbuilt M3 Realtime broadcast); fine at demo scale.
+    const id = setInterval(load, 1500);
     return () => {
       active = false;
       clearInterval(id);
     };
   }, [orgId, windowMinutes, supabase]);
 
-  // Stop watching geolocation on unmount.
+  // Stop watching geolocation (and cancel the first-fix watchdog) on unmount.
   useEffect(() => {
     return () => {
       if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
+      if (awaitTimer.current !== null) clearTimeout(awaitTimer.current);
     };
+  }, []);
+
+  // Track tab visibility so we can tell the user when sharing is paused.
+  useEffect(() => {
+    function onVis() {
+      setHidden(document.visibilityState === "hidden");
+    }
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
+  const stopSharing = useCallback(() => {
+    if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
+    watchId.current = null;
+    if (awaitTimer.current !== null) {
+      clearTimeout(awaitTimer.current);
+      awaitTimer.current = null;
+    }
+    setSharing(false);
+    setLocating(false);
   }, []);
 
   const toggleShare = useCallback(() => {
     if (sharing) {
-      if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
-      watchId.current = null;
-      setSharing(false);
+      stopSharing();
       return;
     }
     if (!("geolocation" in navigator)) {
@@ -118,10 +147,34 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     }
     setShareError(null);
     setSharing(true);
+    setLocating(true);
+    firstFixRef.current = false;
     centeredOnce.current = false;
+
+    // Watchdog: if no fix arrives, don't leave the button stuck on "Locating…".
+    if (awaitTimer.current !== null) clearTimeout(awaitTimer.current);
+    awaitTimer.current = window.setTimeout(() => {
+      if (firstFixRef.current) return;
+      if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
+      watchId.current = null;
+      setSharing(false);
+      setLocating(false);
+      setShareError("Couldn't get a GPS fix — move outdoors and tap Share again.");
+    }, 15000);
+
     watchId.current = navigator.geolocation.watchPosition(
       (pos) => {
         const { latitude, longitude } = pos.coords;
+
+        // First successful fix: leave the "locating" state and cancel the watchdog.
+        if (!firstFixRef.current) {
+          firstFixRef.current = true;
+          setLocating(false);
+          if (awaitTimer.current !== null) {
+            clearTimeout(awaitTimer.current);
+            awaitTimer.current = null;
+          }
+        }
 
         // Show yourself immediately, regardless of the DB round-trip.
         setMyTrail((prev) => [...prev, { lng: longitude, lat: latitude, t: Date.now() }]);
@@ -142,21 +195,29 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
         );
       },
       (err) => {
-        setShareError(err.message || "Location permission denied.");
+        if (awaitTimer.current !== null) {
+          clearTimeout(awaitTimer.current);
+          awaitTimer.current = null;
+        }
+        setShareError(geolocationErrorMessage(err));
         setSharing(false);
+        setLocating(false);
         watchId.current = null;
       },
       { enableHighAccuracy: true, maximumAge: 2000, timeout: 12000 },
     );
-  }, [sharing, supabase]);
+  }, [sharing, stopSharing, supabase]);
 
   const cutoff = Date.now() - windowMinutes * 60_000;
 
   // Other guards from the org feed (exclude myself — I'm rendered locally).
+  // Client-trim to the same cutoff as my own trail so shrinking the time window
+  // updates peers instantly, not only on the next poll.
   const guards = useMemo<Guard[]>(() => {
     const m = new Map<string, Guard>();
     for (const p of points) {
       if (p.guard_id === myId) continue;
+      if (new Date(p.captured_at).getTime() < cutoff) continue;
       const g = m.get(p.guard_id) ?? {
         id: p.guard_id,
         name: p.display_name ?? "Guard",
@@ -167,7 +228,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       m.set(p.guard_id, g);
     }
     return [...m.values()];
-  }, [points, myId]);
+  }, [points, myId, cutoff]);
 
   // My own trail, trimmed to the selected window.
   const myWindowTrail = useMemo(() => myTrail.filter((f) => f.t >= cutoff), [myTrail, cutoff]);
@@ -321,7 +382,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
               cursor: "pointer",
             }}
           >
-            {sharing ? "■ Stop sharing" : "● Share my location"}
+            {sharing ? (locating ? "◌ Locating…" : "■ Stop sharing") : "● Share my location"}
           </button>
           <a href="/admin/settings" style={{ color: "var(--muted)", fontSize: "0.8125rem" }}>
             Admin
@@ -329,6 +390,30 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           <SignOutButton />
         </div>
       </header>
+
+      {!orgId && (
+        <div
+          role="alert"
+          style={{
+            position: "absolute",
+            top: "5rem",
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 5,
+            maxWidth: "32rem",
+            padding: "0.75rem 1rem",
+            background: "var(--danger)",
+            color: "#fff",
+            borderRadius: "var(--radius)",
+            fontSize: "0.875rem",
+            textAlign: "center",
+            boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+          }}
+        >
+          Your account isn’t linked to an organization yet — you won’t see other guards. Ask an
+          admin to add your membership.
+        </div>
+      )}
 
       <footer
         style={{
@@ -348,15 +433,34 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
         {shareError
           ? `Location error: ${shareError}`
           : sharing
-            ? myPos
-              ? "Sharing your location — walk around and watch your trail build."
-              : "Sharing — waiting for your first GPS fix…"
+            ? hidden
+              ? "Sharing paused — phone asleep or tab hidden. Reopen this tab to resume."
+              : locating
+                ? "Allow location, then hold tight — getting your first GPS fix…"
+                : myPos
+                  ? "Sharing your location — walk around and watch your trail build."
+                  : "Sharing — waiting for your first GPS fix…"
             : onMapCount
               ? `${onMapCount} on the map over the last ${windowMinutes}m.`
               : "Tap “Share my location”, allow access, and walk — your trail appears here."}
       </footer>
     </div>
   );
+}
+
+// Turn a raw GeolocationPositionError into an actionable, retry-oriented message
+// — the terse default ("User denied Geolocation") reads as "the app is broken".
+function geolocationErrorMessage(err: GeolocationPositionError): string {
+  switch (err.code) {
+    case err.PERMISSION_DENIED:
+      return "Location permission denied — enable location for this browser in Settings, then tap Share again.";
+    case err.POSITION_UNAVAILABLE:
+      return "Location unavailable — check that Location Services are on, then retry.";
+    case err.TIMEOUT:
+      return "Couldn’t get a GPS fix in time — move outdoors and tap Share again.";
+    default:
+      return err.message || "Location error.";
+  }
 }
 
 const secondaryBtn: React.CSSProperties = {

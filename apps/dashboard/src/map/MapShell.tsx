@@ -24,10 +24,14 @@ const YOU_COLOR = "#38bdf8";
 // first network fix doesn't shoot a line across the map and the dot lands on the
 // real spot — only GPS-grade fixes (≤ this many metres of reported accuracy).
 const ACCURACY_GATE_M = 50;
-// Hold the live dot/trail in place unless a fix moves at least this far — above
-// the GPS noise floor — so a stationary phone stops drifting. Raised toward the
-// reported accuracy when GPS is poor, so noisier fixes need a bigger real move.
-const MOVE_FLOOR_M = 8;
+// Live-dot smoothing: exponential moving-average weight per new fix. Low enough
+// to damp the few-metre GPS jitter while you're still, high enough to follow you
+// when you walk. Lower = steadier but laggier; higher = snappier but jumpier.
+const SMOOTH_ALPHA = 0.3;
+// Minimum move (of the smoothed position) before adding a trail vertex — keeps
+// the line clean and stops it smearing while stationary, independent of how
+// responsively the dot itself tracks.
+const TRAIL_MIN_M = 4;
 
 const MAP_STYLES = {
   satellite: "mapbox://styles/mapbox/satellite-streets-v12",
@@ -73,6 +77,8 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const [hidden, setHidden] = useState(false);
   // Reported accuracy of the latest fix (metres) — shown so "a bit off" is a number.
   const [accuracyM, setAccuracyM] = useState<number | null>(null);
+  // Smoothed live position of the viewer's own dot (EMA of recent fixes).
+  const [displayPos, setDisplayPos] = useState<TrailFix | null>(null);
 
   const mapRef = useRef<MapRef | null>(null);
   const watchId = useRef<number | null>(null);
@@ -80,6 +86,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const centeredOnce = useRef(false);
   const firstFixRef = useRef(false);
   const awaitTimer = useRef<number | null>(null);
+  const displayRef = useRef<TrailFix | null>(null);
 
   const supabase = useMemo(() => createClient(), []);
   const mapboxToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
@@ -145,6 +152,8 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     }
     setSharing(false);
     setLocating(false);
+    displayRef.current = null;
+    setDisplayPos(null);
   }, []);
 
   const toggleShare = useCallback(() => {
@@ -161,6 +170,8 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     setLocating(true);
     firstFixRef.current = false;
     centeredOnce.current = false;
+    displayRef.current = null;
+    setDisplayPos(null);
 
     // Watchdog: if no fix arrives, don't leave the button stuck on "Locating…".
     if (awaitTimer.current !== null) clearTimeout(awaitTimer.current);
@@ -198,15 +209,29 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
 
         setAccuracyM(accuracy ?? null);
 
-        // Append the fix, but only once it clears the GPS noise floor — so the
-        // dot/trail track real movement yet hold steady when you're standing
-        // still (jitter at this accuracy is a few metres per fix).
+        // Smooth the live dot with an exponential moving average: it damps the
+        // few-metre GPS jitter while you're still, yet follows you immediately
+        // when you walk (it updates on every fix, unlike a hard deadband).
+        const prevPos = displayRef.current;
+        const smoothed: TrailFix = prevPos
+          ? {
+              lng: prevPos.lng + SMOOTH_ALPHA * (longitude - prevPos.lng),
+              lat: prevPos.lat + SMOOTH_ALPHA * (latitude - prevPos.lat),
+              t: Date.now(),
+            }
+          : { lng: longitude, lat: latitude, t: Date.now() };
+        displayRef.current = smoothed;
+        setDisplayPos(smoothed);
+
+        // Grow the trail from the smoothed point, but only every few metres so
+        // the line stays clean and never smears while you're standing still.
         setMyTrail((prev) => {
           const last = prev[prev.length - 1];
-          if (!last) return [{ lng: longitude, lat: latitude, t: Date.now() }];
-          const floor = Math.max(MOVE_FLOOR_M, accuracy ?? 0);
-          if (metersBetween(last.lng, last.lat, longitude, latitude) < floor) return prev;
-          return [...prev, { lng: longitude, lat: latitude, t: Date.now() }];
+          if (!last) return [smoothed];
+          if (metersBetween(last.lng, last.lat, smoothed.lng, smoothed.lat) < TRAIL_MIN_M) {
+            return prev;
+          }
+          return [...prev, smoothed];
         });
 
         const now = Date.now();
@@ -255,9 +280,10 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     return [...m.values()];
   }, [points, myId, cutoff]);
 
-  // My own trail, trimmed to the selected window.
+  // My own trail line, trimmed to the selected window. The dot itself is the
+  // smoothed live position (displayPos), decoupled from the windowed trail.
   const myWindowTrail = useMemo(() => myTrail.filter((f) => f.t >= cutoff), [myTrail, cutoff]);
-  const myPos = myWindowTrail[myWindowTrail.length - 1] ?? null;
+  const myPos = displayPos;
 
   const onMapCount = guards.length + (myPos ? 1 : 0);
 

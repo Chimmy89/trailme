@@ -120,12 +120,17 @@ begin
     from raw
     order by raw.guard_id, raw.bucket, raw.captured_at desc
   )
-  select d.guard_id, p.display_name, p.color,
+  -- LEFT JOIN: a guard with breadcrumbs but no profiles row (e.g. signed up
+  -- outside the seed, no profile-on-signup trigger) must still show on the map,
+  -- with a sensible fallback name/colour rather than vanishing.
+  select d.guard_id,
+         coalesce(p.display_name, 'Guard') as display_name,
+         coalesce(p.color, '#3b82f6')      as color,
          extensions.st_y(d.geom::extensions.geometry) as lat,
          extensions.st_x(d.geom::extensions.geometry) as lon,
          d.captured_at
   from decimated d
-  join public.profiles p on p.id = d.guard_id
+  left join public.profiles p on p.id = d.guard_id
   order by d.guard_id, d.captured_at;
 end;
 $$;

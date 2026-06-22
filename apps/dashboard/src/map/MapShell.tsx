@@ -7,7 +7,25 @@ import { TIME_WINDOWS, type Role, type TimeWindow } from "@trailme/shared";
 import { createClient } from "@/lib/supabase/client";
 import { SignOutButton } from "@/components/SignOutButton";
 
-const DEFAULT_CENTER = { longitude: 10.7522, latitude: 59.9139, zoom: 12 };
+const DEFAULT_CENTER = { longitude: 10.7522, latitude: 59.9139, zoom: 13 };
+
+// Property-scale zoom: a 0.5–5 ha site is ~70–220 m across, which sits well at
+// zoom ~18 (building/parking-lot detail). Used for the single-person case.
+const PROPERTY_ZOOM = 18;
+// Never let "fit everyone" zoom out past this (keeps small sites readable) or in
+// past PROPERTY_ZOOM (keeps a lone marker from filling the screen).
+const FIT_MAX_ZOOM = 19;
+
+// Distinct, always-on colour for the viewer's own marker/trail so "you" never
+// blends into the org roster colours.
+const YOU_COLOR = "#38bdf8";
+
+const MAP_STYLES = {
+  satellite: "mapbox://styles/mapbox/satellite-streets-v12",
+  streets: "mapbox://styles/mapbox/streets-v12",
+  dark: "mapbox://styles/mapbox/dark-v11",
+} as const;
+type StyleKey = keyof typeof MAP_STYLES;
 
 type MapShellProps = {
   orgId: string | null;
@@ -26,12 +44,18 @@ type LivePoint = {
 };
 
 type Guard = { id: string; name: string; color: string; pts: LivePoint[] };
+type TrailFix = { lng: number; lat: number; t: number };
 
 export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const [windowMinutes, setWindowMinutes] = useState<TimeWindow>(15);
   const [points, setPoints] = useState<LivePoint[]>([]);
   const [sharing, setSharing] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
+  const [styleKey, setStyleKey] = useState<StyleKey>("satellite");
+  const [myId, setMyId] = useState<string | null>(null);
+  // The viewer's own GPS fixes, kept client-side so you see yourself + your
+  // trail instantly — no dependency on the demo_live_map round-trip.
+  const [myTrail, setMyTrail] = useState<TrailFix[]>([]);
 
   const mapRef = useRef<MapRef | null>(null);
   const watchId = useRef<number | null>(null);
@@ -41,13 +65,30 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const supabase = useMemo(() => createClient(), []);
   const mapboxToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
+  // Who am I? Lets us render our own marker locally and avoid drawing a
+  // duplicate for ourselves from the org-wide feed.
+  useEffect(() => {
+    let active = true;
+    void supabase.auth.getUser().then(({ data }) => {
+      if (active) setMyId(data.user?.id ?? null);
+    });
+    return () => {
+      active = false;
+    };
+  }, [supabase]);
+
   // Poll the live map (positions + recent trail points) for the whole org.
   useEffect(() => {
     if (!orgId) return;
     let active = true;
     async function load() {
-      const { data } = await supabase.rpc("demo_live_map", { p_minutes: windowMinutes });
-      if (active && data) setPoints(data as LivePoint[]);
+      const { data, error } = await supabase.rpc("demo_live_map", { p_minutes: windowMinutes });
+      if (!active) return;
+      if (error) {
+        setShareError(`Live map: ${error.message}`);
+        return;
+      }
+      if (data) setPoints(data as LivePoint[]);
     }
     void load();
     const id = setInterval(load, 3000);
@@ -77,19 +118,28 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     }
     setShareError(null);
     setSharing(true);
+    centeredOnce.current = false;
     watchId.current = navigator.geolocation.watchPosition(
       (pos) => {
         const { latitude, longitude } = pos.coords;
+
+        // Show yourself immediately, regardless of the DB round-trip.
+        setMyTrail((prev) => [...prev, { lng: longitude, lat: latitude, t: Date.now() }]);
+
         if (!centeredOnce.current) {
           centeredOnce.current = true;
-          mapRef.current?.flyTo({ center: [longitude, latitude], zoom: 15 });
+          mapRef.current?.flyTo({ center: [longitude, latitude], zoom: PROPERTY_ZOOM });
         }
+
         const now = Date.now();
         if (now - lastPush.current < 2500) return; // throttle pushes
         lastPush.current = now;
         void supabase
           .rpc("demo_push_position", { p_lat: latitude, p_lon: longitude })
-          .then(({ error }) => error && setShareError(error.message));
+          .then(({ error }) => {
+            if (error) setShareError(`Push: ${error.message}`);
+          })
+          .catch((e: unknown) => setShareError(`Push failed: ${e instanceof Error ? e.message : String(e)}`));
       },
       (err) => {
         setShareError(err.message || "Location permission denied.");
@@ -100,9 +150,13 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     );
   }, [sharing, supabase]);
 
+  const cutoff = Date.now() - windowMinutes * 60_000;
+
+  // Other guards from the org feed (exclude myself — I'm rendered locally).
   const guards = useMemo<Guard[]>(() => {
     const m = new Map<string, Guard>();
     for (const p of points) {
+      if (p.guard_id === myId) continue;
       const g = m.get(p.guard_id) ?? {
         id: p.guard_id,
         name: p.display_name ?? "Guard",
@@ -113,21 +167,63 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       m.set(p.guard_id, g);
     }
     return [...m.values()];
-  }, [points]);
+  }, [points, myId]);
 
-  const trailGeoJSON = useMemo(
-    () => ({
-      type: "FeatureCollection" as const,
-      features: guards
-        .filter((g) => g.pts.length >= 2)
-        .map((g) => ({
-          type: "Feature" as const,
-          properties: { color: g.color },
-          geometry: { type: "LineString" as const, coordinates: g.pts.map((p) => [p.lon, p.lat]) },
-        })),
-    }),
-    [guards],
-  );
+  // My own trail, trimmed to the selected window.
+  const myWindowTrail = useMemo(() => myTrail.filter((f) => f.t >= cutoff), [myTrail, cutoff]);
+  const myPos = myWindowTrail[myWindowTrail.length - 1] ?? null;
+
+  const onMapCount = guards.length + (myPos ? 1 : 0);
+
+  const trailGeoJSON = useMemo(() => {
+    const features = guards
+      .filter((g) => g.pts.length >= 2)
+      .map((g) => ({
+        type: "Feature" as const,
+        properties: { color: g.color },
+        geometry: { type: "LineString" as const, coordinates: g.pts.map((p) => [p.lon, p.lat]) },
+      }));
+    if (myWindowTrail.length >= 2) {
+      features.push({
+        type: "Feature" as const,
+        properties: { color: YOU_COLOR },
+        geometry: { type: "LineString" as const, coordinates: myWindowTrail.map((f) => [f.lng, f.lat]) },
+      });
+    }
+    return { type: "FeatureCollection" as const, features };
+  }, [guards, myWindowTrail]);
+
+  // Frame everyone currently on the map (you + other guards' latest positions).
+  const fitAll = useCallback(() => {
+    const coords: [number, number][] = [];
+    if (myPos) coords.push([myPos.lng, myPos.lat]);
+    for (const g of guards) {
+      const last = g.pts[g.pts.length - 1];
+      if (last) coords.push([last.lon, last.lat]);
+    }
+    if (coords.length === 0) return;
+    if (coords.length === 1) {
+      mapRef.current?.flyTo({ center: coords[0], zoom: PROPERTY_ZOOM });
+      return;
+    }
+    let minLng = coords[0][0],
+      maxLng = coords[0][0],
+      minLat = coords[0][1],
+      maxLat = coords[0][1];
+    for (const [lng, lat] of coords) {
+      minLng = Math.min(minLng, lng);
+      maxLng = Math.max(maxLng, lng);
+      minLat = Math.min(minLat, lat);
+      maxLat = Math.max(maxLat, lat);
+    }
+    mapRef.current?.fitBounds(
+      [
+        [minLng, minLat],
+        [maxLng, maxLat],
+      ],
+      { padding: 80, maxZoom: FIT_MAX_ZOOM, duration: 600 },
+    );
+  }, [guards, myPos]);
 
   return (
     <div style={{ position: "relative", width: "100%", height: "100dvh" }}>
@@ -136,7 +232,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           ref={mapRef}
           mapboxAccessToken={mapboxToken}
           initialViewState={DEFAULT_CENTER}
-          mapStyle="mapbox://styles/mapbox/dark-v11"
+          mapStyle={MAP_STYLES[styleKey]}
           style={{ width: "100%", height: "100%" }}
         >
           <Source id="trails" type="geojson" data={trailGeoJSON}>
@@ -144,7 +240,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
               id="trail-lines"
               type="line"
               layout={{ "line-cap": "round", "line-join": "round" }}
-              paint={{ "line-color": ["get", "color"], "line-width": 4, "line-opacity": 0.7 }}
+              paint={{ "line-color": ["get", "color"], "line-width": 4, "line-opacity": 0.85 }}
             />
           </Source>
 
@@ -153,33 +249,16 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
             if (!last) return null;
             return (
               <Marker key={g.id} longitude={last.lon} latitude={last.lat} anchor="center">
-                <div style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
-                  <span
-                    style={{
-                      width: 14,
-                      height: 14,
-                      borderRadius: "50%",
-                      background: g.color,
-                      border: "2px solid #fff",
-                      boxShadow: "0 0 0 1px rgba(0,0,0,0.4)",
-                    }}
-                  />
-                  <span
-                    style={{
-                      fontSize: "0.75rem",
-                      color: "#fff",
-                      background: "rgba(0,0,0,0.6)",
-                      padding: "0 0.25rem",
-                      borderRadius: 4,
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    {g.name}
-                  </span>
-                </div>
+                <GuardDot color={g.color} label={g.name} />
               </Marker>
             );
           })}
+
+          {myPos && (
+            <Marker longitude={myPos.lng} latitude={myPos.lat} anchor="center">
+              <GuardDot color={YOU_COLOR} label="You" emphasized />
+            </Marker>
+          )}
         </MapGL>
       ) : (
         <div style={{ display: "grid", placeItems: "center", width: "100%", height: "100%", color: "var(--muted)" }}>
@@ -210,7 +289,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           <span style={{ color: "var(--muted)", fontSize: "0.8125rem" }}>
             {email ?? "—"}
             {role ? ` · ${role}` : ""}
-            {` · ${guards.length} on map`}
+            {` · ${onMapCount} on map`}
           </span>
         </div>
 
@@ -224,6 +303,10 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           }}
         >
           <TimeWindowSelector value={windowMinutes} onChange={setWindowMinutes} />
+          <StyleSelector value={styleKey} onChange={setStyleKey} />
+          <button type="button" onClick={fitAll} style={secondaryBtn}>
+            Fit
+          </button>
           <button
             type="button"
             onClick={toggleShare}
@@ -264,11 +347,85 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
         {shareError
           ? `Location error: ${shareError}`
           : sharing
-            ? "Sharing your location — walk around and watch your trail build."
-            : guards.length
-              ? `${guards.length} guard(s) on the map over the last ${windowMinutes}m.`
+            ? myPos
+              ? "Sharing your location — walk around and watch your trail build."
+              : "Sharing — waiting for your first GPS fix…"
+            : onMapCount
+              ? `${onMapCount} on the map over the last ${windowMinutes}m.`
               : "Tap “Share my location”, allow access, and walk — your trail appears here."}
       </footer>
+    </div>
+  );
+}
+
+const secondaryBtn: React.CSSProperties = {
+  padding: "0.375rem 0.75rem",
+  background: "var(--surface-2)",
+  color: "var(--foreground)",
+  border: "1px solid var(--border)",
+  borderRadius: "6px",
+  fontWeight: 600,
+  cursor: "pointer",
+};
+
+function GuardDot({ color, label, emphasized }: { color: string; label: string; emphasized?: boolean }) {
+  const size = emphasized ? 18 : 14;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "0.25rem" }}>
+      <span
+        style={{
+          width: size,
+          height: size,
+          borderRadius: "50%",
+          background: color,
+          border: "2px solid #fff",
+          boxShadow: emphasized
+            ? `0 0 0 3px ${color}55, 0 0 0 1px rgba(0,0,0,0.5)`
+            : "0 0 0 1px rgba(0,0,0,0.4)",
+        }}
+      />
+      <span
+        style={{
+          fontSize: "0.75rem",
+          color: "#fff",
+          background: "rgba(0,0,0,0.6)",
+          padding: "0 0.25rem",
+          borderRadius: 4,
+          whiteSpace: "nowrap",
+          fontWeight: emphasized ? 700 : 400,
+        }}
+      >
+        {label}
+      </span>
+    </div>
+  );
+}
+
+function StyleSelector({ value, onChange }: { value: StyleKey; onChange: (next: StyleKey) => void }) {
+  const labels: Record<StyleKey, string> = { satellite: "Satellite", streets: "Streets", dark: "Dark" };
+  return (
+    <div role="group" aria-label="Map style" style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap" }}>
+      {(Object.keys(labels) as StyleKey[]).map((key) => {
+        const active = key === value;
+        return (
+          <button
+            key={key}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onChange(key)}
+            style={{
+              padding: "0.25rem 0.5rem",
+              background: active ? "var(--accent)" : "var(--surface-2)",
+              color: active ? "var(--accent-foreground)" : "var(--foreground)",
+              border: "1px solid var(--border)",
+              borderRadius: "6px",
+              fontWeight: active ? 600 : 400,
+            }}
+          >
+            {labels[key]}
+          </button>
+        );
+      })}
     </div>
   );
 }

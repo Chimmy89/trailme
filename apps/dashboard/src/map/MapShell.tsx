@@ -6,29 +6,25 @@ import "mapbox-gl/dist/mapbox-gl.css";
 import { TIME_WINDOWS, type Role, type TimeWindow } from "@trailme/shared";
 import { createClient } from "@/lib/supabase/client";
 import { SignOutButton } from "@/components/SignOutButton";
+import { GpsKalman } from "./gpsKalman";
+import { pushTrailPoint, trailToLine, type TrailPoint } from "./trail";
+import { circlePolygon, metersBetween } from "./geo";
 
 const DEFAULT_CENTER = { longitude: 10.7522, latitude: 59.9139, zoom: 13 };
 
 // Property-scale zoom: a 0.5–5 ha site is ~70–220 m across, which sits well at
 // zoom ~18 (building/parking-lot detail). Used for the single-person case.
 const PROPERTY_ZOOM = 18;
-// Never let "fit everyone" zoom out past this (keeps small sites readable) or in
-// past PROPERTY_ZOOM (keeps a lone marker from filling the screen).
 const FIT_MAX_ZOOM = 19;
 
-// Distinct, always-on colour for the viewer's own marker/trail so "you" never
-// blends into the org roster colours.
+// Distinct, always-on colour for the viewer's own marker/trail/halo.
 const YOU_COLOR = "#38bdf8";
 
-// Drop coarse fixes (Wi-Fi/cell locate, often hundreds of metres off) so the
-// first network fix doesn't shoot a line across the map and the dot lands on the
-// real spot — only GPS-grade fixes (≤ this many metres of reported accuracy).
-const ACCURACY_GATE_M = 50;
-// Hold the live dot rock-steady until a fix moves at least this far — above the
-// GPS jitter floor — then snap it to the new position. Fixed, NOT scaled by
-// reported accuracy: scaling let a momentary accuracy spike balloon the
-// threshold and block real movement (the dot looked stuck).
-const MOVE_FLOOR_M = 8;
+// rAF easing toward the filtered target (smaller = smoother + laggier render).
+const RENDER_EASE = 0.15;
+// Don't re-render the marker for sub-decimetre animation steps (caps renders
+// when the dot is parked — no work while you stand still).
+const RENDER_COMMIT_M = 0.15;
 
 const MAP_STYLES = {
   satellite: "mapbox://styles/mapbox/satellite-streets-v12",
@@ -54,7 +50,7 @@ type LivePoint = {
 };
 
 type Guard = { id: string; name: string; color: string; pts: LivePoint[] };
-type TrailFix = { lng: number; lat: number; t: number };
+type LL = { lng: number; lat: number };
 
 export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const [windowMinutes, setWindowMinutes] = useState<TimeWindow>(15);
@@ -63,19 +59,17 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const [shareError, setShareError] = useState<string | null>(null);
   const [styleKey, setStyleKey] = useState<StyleKey>("satellite");
   const [myId, setMyId] = useState<string | null>(null);
-  // The viewer's own GPS fixes, kept client-side so you see yourself + your
-  // trail instantly — no dependency on the demo_live_map round-trip.
-  const [myTrail, setMyTrail] = useState<TrailFix[]>([]);
-  // Distinguish "asked for location, no fix yet" from "actively sharing" so the
-  // button + footer don't lie during the fragile first-fix window.
   const [locating, setLocating] = useState(false);
-  // Mobile browsers suspend watchPosition when the tab is hidden / screen locks;
-  // surface that instead of leaving a frozen dot that looks live.
   const [hidden, setHidden] = useState(false);
-  // Reported accuracy of the latest fix (metres) — shown so "a bit off" is a number.
+  // Filtered 1-σ accuracy (metres) — drives the halo radius + the status readout.
   const [accuracyM, setAccuracyM] = useState<number | null>(null);
-  // Smoothed live position of the viewer's own dot (EMA of recent fixes).
-  const [displayPos, setDisplayPos] = useState<TrailFix | null>(null);
+  // The RENDERED (rAF-interpolated) self position — what the dot + halo show.
+  const [displayPos, setDisplayPos] = useState<LL | null>(null);
+  // The viewer's own recorded trail (filtered points; decimated + simplified on render).
+  const [myTrail, setMyTrail] = useState<TrailPoint[]>([]);
+  // Coarse clock so the time-window cutoff (and its memos) don't recompute every
+  // animation frame — only every couple of seconds.
+  const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
   const mapRef = useRef<MapRef | null>(null);
   const watchId = useRef<number | null>(null);
@@ -83,13 +77,15 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const centeredOnce = useRef(false);
   const firstFixRef = useRef(false);
   const awaitTimer = useRef<number | null>(null);
-  const displayRef = useRef<TrailFix | null>(null);
+  const selfKf = useRef<GpsKalman | null>(null);
+  const targetRef = useRef<LL | null>(null); // latest filtered position
+  const renderedRef = useRef<LL | null>(null); // interpolated position
 
   const supabase = useMemo(() => createClient(), []);
   const mapboxToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
 
-  // Who am I? Lets us render our own marker locally and avoid drawing a
-  // duplicate for ourselves from the org-wide feed.
+  // Who am I? Lets us render our own marker locally and avoid drawing a duplicate
+  // for ourselves from the org-wide feed.
   useEffect(() => {
     let active = true;
     void supabase.auth.getUser().then(({ data }) => {
@@ -100,7 +96,13 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     };
   }, [supabase]);
 
-  // Poll the live map (positions + recent trail points) for the whole org.
+  // Coarse clock tick (keeps the window cutoff stable between frames).
+  useEffect(() => {
+    const id = setInterval(() => setNowTick(Date.now()), 2000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Poll the live map (org-wide positions + recent trail points).
   useEffect(() => {
     if (!orgId) return;
     let active = true;
@@ -114,8 +116,6 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       if (data) setPoints(data as LivePoint[]);
     }
     void load();
-    // ~1.5s keeps peer dots/trails feeling live (the demo stand-in for the
-    // unbuilt M3 Realtime broadcast); fine at demo scale.
     const id = setInterval(load, 1500);
     return () => {
       active = false;
@@ -123,7 +123,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     };
   }, [orgId, windowMinutes, supabase]);
 
-  // Stop watching geolocation (and cancel the first-fix watchdog) on unmount.
+  // Watch teardown on unmount.
   useEffect(() => {
     return () => {
       if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
@@ -131,14 +131,106 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     };
   }, []);
 
-  // Track tab visibility so we can tell the user when sharing is paused.
+  // requestAnimationFrame loop: ease the rendered dot toward the filtered target
+  // so it glides smoothly between the (≤1 Hz) fixes instead of teleporting.
   useEffect(() => {
-    function onVis() {
-      setHidden(document.visibilityState === "hidden");
+    if (!sharing) return;
+    let raf = 0;
+    const step = () => {
+      const tgt = targetRef.current;
+      const rnd = renderedRef.current;
+      if (tgt && rnd) {
+        const next = {
+          lng: rnd.lng + (tgt.lng - rnd.lng) * RENDER_EASE,
+          lat: rnd.lat + (tgt.lat - rnd.lat) * RENDER_EASE,
+        };
+        renderedRef.current = next;
+        setDisplayPos((prev) =>
+          prev && metersBetween(prev.lng, prev.lat, next.lng, next.lat) < RENDER_COMMIT_M
+            ? prev
+            : next,
+        );
+      }
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [sharing]);
+
+  // ---- geolocation watch (filter every fix; never gate/drop) ----
+  const startWatch = useCallback(() => {
+    if (!("geolocation" in navigator)) {
+      setShareError("This browser has no geolocation.");
+      return;
     }
-    document.addEventListener("visibilitychange", onVis);
-    return () => document.removeEventListener("visibilitychange", onVis);
-  }, []);
+    if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
+    watchId.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const { latitude, longitude, accuracy } = pos.coords;
+        const t = pos.timestamp || Date.now();
+
+        if (!firstFixRef.current) {
+          firstFixRef.current = true;
+          setLocating(false);
+          if (awaitTimer.current !== null) {
+            clearTimeout(awaitTimer.current);
+            awaitTimer.current = null;
+          }
+        }
+        setShareError(null);
+
+        if (!selfKf.current) selfKf.current = new GpsKalman();
+        const f = selfKf.current.update({ lat: latitude, lng: longitude, accuracy, timestamp: t });
+        setAccuracyM(f.accuracy);
+
+        const target: LL = { lng: f.lng, lat: f.lat };
+        targetRef.current = target;
+        if (renderedRef.current == null) {
+          renderedRef.current = target; // snap on first fix / after a re-seed
+          setDisplayPos(target);
+        }
+        if (!centeredOnce.current) {
+          centeredOnce.current = true;
+          mapRef.current?.flyTo({ center: [f.lng, f.lat], zoom: PROPERTY_ZOOM });
+        }
+
+        setMyTrail((prev) => pushTrailPoint(prev, { lng: f.lng, lat: f.lat, t, acc: f.accuracy }));
+
+        // Push the FILTERED position so the DB + every peer's trail are clean at
+        // the source. ~1 Hz while moving, ~every 4 s as a keepalive while still.
+        // (Migration 0010 adds an optional p_accuracy; until it's deployed we push
+        // the 2-arg form, which still carries the clean filtered lat/lng.)
+        const interval = selfKf.current.speed > 0.5 ? 1000 : 4000;
+        const now = Date.now();
+        if (now - lastPush.current < interval) return;
+        lastPush.current = now;
+        void supabase.rpc("demo_push_position", { p_lat: f.lat, p_lon: f.lng }).then(
+          ({ error }) => {
+            if (error) setShareError(`Push: ${error.message}`);
+          },
+          (e: unknown) => setShareError(`Push failed: ${e instanceof Error ? e.message : String(e)}`),
+        );
+      },
+      (err) => {
+        if (err.code === err.PERMISSION_DENIED) {
+          if (awaitTimer.current !== null) {
+            clearTimeout(awaitTimer.current);
+            awaitTimer.current = null;
+          }
+          if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
+          watchId.current = null;
+          setShareError(geolocationErrorMessage(err));
+          setSharing(false);
+          setLocating(false);
+        } else {
+          // TIMEOUT / POSITION_UNAVAILABLE are transient — keep the watch alive
+          // (clearing it is what looks like a freeze) and just surface it.
+          setShareError(geolocationErrorMessage(err));
+        }
+      },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 },
+    );
+  }, [supabase]);
 
   const stopSharing = useCallback(() => {
     if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current);
@@ -149,7 +241,9 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     }
     setSharing(false);
     setLocating(false);
-    displayRef.current = null;
+    selfKf.current = null;
+    targetRef.current = null;
+    renderedRef.current = null;
     setDisplayPos(null);
   }, []);
 
@@ -167,10 +261,13 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     setLocating(true);
     firstFixRef.current = false;
     centeredOnce.current = false;
-    displayRef.current = null;
+    selfKf.current = new GpsKalman();
+    targetRef.current = null;
+    renderedRef.current = null;
     setDisplayPos(null);
+    setMyTrail([]);
+    lastPush.current = 0;
 
-    // Watchdog: if no fix arrives, don't leave the button stuck on "Locating…".
     if (awaitTimer.current !== null) clearTimeout(awaitTimer.current);
     awaitTimer.current = window.setTimeout(() => {
       if (firstFixRef.current) return;
@@ -181,74 +278,28 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       setShareError("Couldn't get a GPS fix — move outdoors and tap Share again.");
     }, 15000);
 
-    watchId.current = navigator.geolocation.watchPosition(
-      (pos) => {
-        const { latitude, longitude, accuracy } = pos.coords;
+    startWatch();
+  }, [sharing, stopSharing, startWatch]);
 
-        // Ignore coarse (non-GPS) fixes entirely — they're what make the trail
-        // jump across the map and the dot land a block away.
-        if (accuracy != null && accuracy > ACCURACY_GATE_M) return;
+  // Mobile browsers suspend watchPosition when hidden/locked. On regain, re-seed
+  // the filter (so we don't lerp across the gap) and restart the watch.
+  useEffect(() => {
+    function onVis() {
+      const isHidden = document.visibilityState === "hidden";
+      setHidden(isHidden);
+      if (!isHidden && sharing) {
+        selfKf.current?.reset();
+        renderedRef.current = null;
+        startWatch();
+      }
+    }
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [sharing, startWatch]);
 
-        // First accurate fix: leave the "locating" state and cancel the watchdog.
-        if (!firstFixRef.current) {
-          firstFixRef.current = true;
-          setLocating(false);
-          if (awaitTimer.current !== null) {
-            clearTimeout(awaitTimer.current);
-            awaitTimer.current = null;
-          }
-        }
+  const cutoff = nowTick - windowMinutes * 60_000;
 
-        if (!centeredOnce.current) {
-          centeredOnce.current = true;
-          mapRef.current?.flyTo({ center: [longitude, latitude], zoom: PROPERTY_ZOOM });
-        }
-
-        setAccuracyM(accuracy ?? null);
-
-        // Hold the dot rock-steady until you move past the GPS jitter, then snap
-        // it to the new fix and drop a trail point there. (Averaging was tried
-        // and wandered; a fixed hold-and-snap stays put when you're standing.)
-        const prevPos = displayRef.current;
-        const moved =
-          prevPos == null ||
-          metersBetween(prevPos.lng, prevPos.lat, longitude, latitude) >= MOVE_FLOOR_M;
-        if (moved) {
-          const next: TrailFix = { lng: longitude, lat: latitude, t: Date.now() };
-          displayRef.current = next;
-          setDisplayPos(next);
-          setMyTrail((prev) => [...prev, next]);
-        }
-
-        const now = Date.now();
-        if (now - lastPush.current < 2500) return; // throttle pushes
-        lastPush.current = now;
-        void supabase.rpc("demo_push_position", { p_lat: latitude, p_lon: longitude }).then(
-          ({ error }) => {
-            if (error) setShareError(`Push: ${error.message}`);
-          },
-          (e: unknown) => setShareError(`Push failed: ${e instanceof Error ? e.message : String(e)}`),
-        );
-      },
-      (err) => {
-        if (awaitTimer.current !== null) {
-          clearTimeout(awaitTimer.current);
-          awaitTimer.current = null;
-        }
-        setShareError(geolocationErrorMessage(err));
-        setSharing(false);
-        setLocating(false);
-        watchId.current = null;
-      },
-      { enableHighAccuracy: true, maximumAge: 2000, timeout: 12000 },
-    );
-  }, [sharing, stopSharing, supabase]);
-
-  const cutoff = Date.now() - windowMinutes * 60_000;
-
-  // Other guards from the org feed (exclude myself — I'm rendered locally).
-  // Client-trim to the same cutoff as my own trail so shrinking the time window
-  // updates peers instantly, not only on the next poll.
+  // Other guards from the org feed (exclude myself — rendered locally).
   const guards = useMemo<Guard[]>(() => {
     const m = new Map<string, Guard>();
     for (const p of points) {
@@ -266,32 +317,27 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     return [...m.values()];
   }, [points, myId, cutoff]);
 
-  // My own trail line, trimmed to the selected window. The dot itself is the
-  // smoothed live position (displayPos), decoupled from the windowed trail.
   const myWindowTrail = useMemo(() => myTrail.filter((f) => f.t >= cutoff), [myTrail, cutoff]);
   const myPos = displayPos;
-
   const onMapCount = guards.length + (myPos ? 1 : 0);
+
+  const selfHalo = useMemo(
+    () =>
+      sharing && displayPos && accuracyM != null
+        ? circlePolygon(displayPos.lng, displayPos.lat, accuracyM)
+        : null,
+    [sharing, displayPos, accuracyM],
+  );
 
   const trailGeoJSON = useMemo(() => {
     const features = guards
       .filter((g) => g.pts.length >= 2)
-      .map((g) => ({
-        type: "Feature" as const,
-        properties: { color: g.color },
-        geometry: { type: "LineString" as const, coordinates: g.pts.map((p) => [p.lon, p.lat]) },
-      }));
-    if (myWindowTrail.length >= 2) {
-      features.push({
-        type: "Feature" as const,
-        properties: { color: YOU_COLOR },
-        geometry: { type: "LineString" as const, coordinates: myWindowTrail.map((f) => [f.lng, f.lat]) },
-      });
-    }
+      .map((g) => lineFeature(g.color, g.pts.map((p) => [p.lon, p.lat])));
+    const selfLine = trailToLine(myWindowTrail);
+    if (selfLine.length >= 2) features.push(lineFeature(YOU_COLOR, selfLine));
     return { type: "FeatureCollection" as const, features };
   }, [guards, myWindowTrail]);
 
-  // Frame everyone currently on the map (you + other guards' latest positions).
   const fitAll = useCallback(() => {
     const coords: [number, number][] = [];
     if (myPos) coords.push([myPos.lng, myPos.lat]);
@@ -305,10 +351,10 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       mapRef.current?.flyTo({ center: first, zoom: PROPERTY_ZOOM });
       return;
     }
-    let minLng = first[0],
-      maxLng = first[0],
-      minLat = first[1],
-      maxLat = first[1];
+    let minLng = first[0];
+    let maxLng = first[0];
+    let minLat = first[1];
+    let maxLat = first[1];
     for (const [lng, lat] of coords) {
       minLng = Math.min(minLng, lng);
       maxLng = Math.max(maxLng, lng);
@@ -342,6 +388,21 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
               paint={{ "line-color": ["get", "color"], "line-width": 4, "line-opacity": 0.85 }}
             />
           </Source>
+
+          {selfHalo && (
+            <Source id="self-accuracy" type="geojson" data={selfHalo}>
+              <Layer
+                id="self-accuracy-fill"
+                type="fill"
+                paint={{ "fill-color": YOU_COLOR, "fill-opacity": 0.12 }}
+              />
+              <Layer
+                id="self-accuracy-line"
+                type="line"
+                paint={{ "line-color": YOU_COLOR, "line-opacity": 0.35, "line-width": 1 }}
+              />
+            </Source>
+          )}
 
           {guards.map((g) => {
             const last = g.pts[g.pts.length - 1];
@@ -485,20 +546,15 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   );
 }
 
-// Great-circle distance in metres between two lon/lat points (haversine).
-function metersBetween(aLng: number, aLat: number, bLng: number, bLat: number): number {
-  const R = 6371000;
-  const dLat = ((bLat - aLat) * Math.PI) / 180;
-  const dLng = ((bLng - aLng) * Math.PI) / 180;
-  const lat1 = (aLat * Math.PI) / 180;
-  const lat2 = (bLat * Math.PI) / 180;
-  const h =
-    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
+function lineFeature(color: string, coordinates: [number, number][]) {
+  return {
+    type: "Feature" as const,
+    properties: { color },
+    geometry: { type: "LineString" as const, coordinates },
+  };
 }
 
-// Turn a raw GeolocationPositionError into an actionable, retry-oriented message
-// — the terse default ("User denied Geolocation") reads as "the app is broken".
+// Turn a raw GeolocationPositionError into an actionable, retry-oriented message.
 function geolocationErrorMessage(err: GeolocationPositionError): string {
   switch (err.code) {
     case err.PERMISSION_DENIED:
@@ -506,7 +562,7 @@ function geolocationErrorMessage(err: GeolocationPositionError): string {
     case err.POSITION_UNAVAILABLE:
       return "Location unavailable — check that Location Services are on, then retry.";
     case err.TIMEOUT:
-      return "Couldn’t get a GPS fix in time — move outdoors and tap Share again.";
+      return "Still searching for GPS — move outdoors for a clearer sky view.";
     default:
       return err.message || "Location error.";
   }

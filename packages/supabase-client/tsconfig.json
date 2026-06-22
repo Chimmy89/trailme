@@ -1,4 +1,10 @@
 {
   "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // service.ts guards against being bundled into the browser with a `typeof
+    // window` check; the DOM lib supplies that ambient global so the package's
+    // own `tsc --noEmit` is green (consumers add DOM via their own tsconfig).
+    "lib": ["ES2022", "DOM"]
+  },
   "include": ["src"]
 }

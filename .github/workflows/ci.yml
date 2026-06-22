@@ -1,0 +1,26 @@
+name: CI
+
+# Minimal pre-merge gate. The dashboard build break that shipped to main in
+# 56e4fe4 was a pure type error — `pnpm -r typecheck` catches that whole class
+# before it reaches the Vercel deploy. The full `next build` stays on Vercel
+# (it needs the NEXT_PUBLIC_* env), so CI here is env-free and fast.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r typecheck

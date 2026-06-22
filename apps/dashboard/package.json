@@ -11,17 +11,17 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@supabase/ssr": "^0.12.0",
+    "@supabase/ssr": "~0.12.0",
     "@supabase/supabase-js": "^2.108",
     "@trailme/db-types": "workspace:*",
     "@trailme/map-style": "workspace:*",
     "@trailme/shared": "workspace:*",
     "@trailme/supabase-client": "workspace:*",
-    "mapbox-gl": "^3.6",
+    "mapbox-gl": "~3.25.0",
     "next": "^15",
     "react": "^19",
     "react-dom": "^19",
-    "react-map-gl": "^7.1"
+    "react-map-gl": "~7.1.9"
   },
   "devDependencies": {
     "@types/mapbox-gl": "^3.4",

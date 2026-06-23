@@ -196,15 +196,16 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
 
         setMyTrail((prev) => pushTrailPoint(prev, { lng: f.lng, lat: f.lat, t, acc: f.accuracy }));
 
-        // Push the FILTERED position so the DB + every peer's trail are clean at
-        // the source. ~1 Hz while moving, ~every 4 s as a keepalive while still.
-        // (Migration 0010 adds an optional p_accuracy; until it's deployed we push
-        // the 2-arg form, which still carries the clean filtered lat/lng.)
+        // Push the FILTERED position + its honest 1-σ accuracy so the DB and
+        // every peer's trail are clean at the source. ~1 Hz while moving, ~every
+        // 4 s as a keepalive while still.
         const interval = selfKf.current.speed > 0.5 ? 1000 : 4000;
         const now = Date.now();
         if (now - lastPush.current < interval) return;
         lastPush.current = now;
-        void supabase.rpc("demo_push_position", { p_lat: f.lat, p_lon: f.lng }).then(
+        void supabase
+          .rpc("demo_push_position", { p_lat: f.lat, p_lon: f.lng, p_accuracy: f.accuracy })
+          .then(
           ({ error }) => {
             if (error) setShareError(`Push: ${error.message}`);
           },

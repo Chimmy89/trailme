@@ -1525,6 +1525,54 @@ export type Database = {
         }
         Relationships: []
       }
+      location_breadcrumbs_20260702: {
+        Row: {
+          accuracy_m: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id: string
+          ingested_at: string
+          install_id: string
+          is_keepalive: boolean
+          is_low_confidence: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Insert: {
+          accuracy_m?: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id?: string
+          ingested_at?: string
+          install_id: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Update: {
+          accuracy_m?: number | null
+          captured_at?: string
+          client_seq?: number
+          geom?: unknown
+          guard_id?: string
+          id?: string
+          ingested_at?: string
+          install_id?: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id?: string
+          partition_ts?: string
+          site_id?: string
+        }
+        Relationships: []
+      }
       location_breadcrumbs_default: {
         Row: {
           accuracy_m: number | null
@@ -1799,7 +1847,7 @@ export type Database = {
         }[]
       }
       demo_push_position: {
-        Args: { p_lat: number; p_lon: number }
+        Args: { p_accuracy?: number; p_lat: number; p_lon: number }
         Returns: undefined
       }
       drop_aged_partitions: {

@@ -4,10 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { TIME_WINDOWS, type Role, type TimeWindow } from "@trailme/shared";
+import { coverageHeatmapLayer, SOURCE_IDS } from "@trailme/map-style";
 import { createClient } from "@/lib/supabase/client";
 import { SignOutButton } from "@/components/SignOutButton";
 import { GpsKalman } from "./gpsKalman";
 import { pushTrailPoint, trailToLine, type TrailPoint } from "./trail";
+import { buildCoverageGeoJSON } from "./coverage";
 import { circlePolygon, metersBetween } from "./geo";
 
 const DEFAULT_CENTER = { longitude: 10.7522, latitude: 59.9139, zoom: 13 };
@@ -19,6 +21,16 @@ const FIT_MAX_ZOOM = 19;
 
 // Distinct, always-on colour for the viewer's own marker/trail/halo.
 const YOU_COLOR = "#38bdf8";
+
+// Coverage heatmap paint, built once (pure, no deps) so the paint object is a
+// stable reference — calling the factory per render would re-diff the layer.
+const HEATMAP_SPEC = coverageHeatmapLayer();
+// react-map-gl's LayerProps is a union discriminated by `type`; narrow it to the
+// heatmap member so the portable PaintSpec lands on the right paint shape.
+type HeatmapPaint = Extract<React.ComponentProps<typeof Layer>, { type: "heatmap" }>["paint"];
+// >0 snaps coverage to an N-metre grid (keep freshest per cell) = "area covered".
+// 0 = honest dwell density (default). Try 8 (≈ GPS floor) if parked guards over-hot.
+const COVERAGE_BIN_METERS = 0;
 
 // rAF easing toward the filtered target (smaller = smoother + laggier render).
 const RENDER_EASE = 0.15;
@@ -58,6 +70,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const [sharing, setSharing] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
   const [styleKey, setStyleKey] = useState<StyleKey>("satellite");
+  const [showHeatmap, setShowHeatmap] = useState(false);
   const [myId, setMyId] = useState<string | null>(null);
   const [locating, setLocating] = useState(false);
   const [hidden, setHidden] = useState(false);
@@ -319,6 +332,20 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   }, [points, myId, cutoff]);
 
   const myWindowTrail = useMemo(() => myTrail.filter((f) => f.t >= cutoff), [myTrail, cutoff]);
+
+  // Coverage heatmap source: org-wide breadcrumbs (incl. self), each weighted by
+  // recency. Same poll/clock cadence as the trail memos — never per animation frame.
+  const coverageGeoJSON = useMemo(
+    () =>
+      buildCoverageGeoJSON(
+        points,
+        nowTick,
+        windowMinutes * 60_000,
+        COVERAGE_BIN_METERS > 0 ? { binMeters: COVERAGE_BIN_METERS } : undefined,
+      ),
+    [points, nowTick, windowMinutes],
+  );
+
   const myPos = displayPos;
   const onMapCount = guards.length + (myPos ? 1 : 0);
 
@@ -389,6 +416,21 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
               paint={{ "line-color": ["get", "color"], "line-width": 4, "line-opacity": 0.85 }}
             />
           </Source>
+
+          {/* Coverage heatmap (M4). beforeId pins it BELOW the trail line — react-map-gl
+              z-order follows addLayer order, NOT JSX order, and the toggle mounts this
+              after load, so without an anchor it would paint OVER the trails. Rendered
+              after the trails <Source> so "trail-lines" always exists first. */}
+          {showHeatmap && coverageGeoJSON.features.length > 0 && (
+            <Source id={SOURCE_IDS.COVERAGE} type="geojson" data={coverageGeoJSON}>
+              <Layer
+                id={HEATMAP_SPEC.id}
+                type="heatmap"
+                beforeId="trail-lines"
+                paint={HEATMAP_SPEC.paint as unknown as HeatmapPaint}
+              />
+            </Source>
+          )}
 
           {selfHalo && (
             <Source id="self-accuracy" type="geojson" data={selfHalo}>
@@ -465,6 +507,18 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
         >
           <TimeWindowSelector value={windowMinutes} onChange={setWindowMinutes} />
           <StyleSelector value={styleKey} onChange={setStyleKey} />
+          <button
+            type="button"
+            aria-pressed={showHeatmap}
+            onClick={() => setShowHeatmap((v) => !v)}
+            style={{
+              ...secondaryBtn,
+              background: showHeatmap ? "var(--accent)" : "var(--surface-2)",
+              color: showHeatmap ? "var(--accent-foreground)" : "var(--foreground)",
+            }}
+          >
+            Heatmap
+          </button>
           <button type="button" onClick={fitAll} style={secondaryBtn}>
             Fit
           </button>

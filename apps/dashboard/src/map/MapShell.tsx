@@ -4,12 +4,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MapGL, { Marker, Source, Layer, type MapRef } from "react-map-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { TIME_WINDOWS, type Role, type TimeWindow } from "@trailme/shared";
-import { coverageHeatmapLayer, SOURCE_IDS } from "@trailme/map-style";
+import { coverageHeatmapLayer, trailLineLayer, trailSourceId, SOURCE_IDS } from "@trailme/map-style";
 import { createClient } from "@/lib/supabase/client";
 import { SignOutButton } from "@/components/SignOutButton";
 import { GpsKalman } from "./gpsKalman";
 import { pushTrailPoint, trailToLine, type TrailPoint } from "./trail";
-import { buildCoverageGeoJSON } from "./coverage";
+import { ageNorm, buildCoverageGeoJSON, type CoverageCollection } from "./coverage";
 import { circlePolygon, metersBetween } from "./geo";
 
 const DEFAULT_CENTER = { longitude: 10.7522, latitude: 59.9139, zoom: 13 };
@@ -28,9 +28,14 @@ const HEATMAP_SPEC = coverageHeatmapLayer();
 // react-map-gl's LayerProps is a union discriminated by `type`; narrow it to the
 // heatmap member so the portable PaintSpec lands on the right paint shape.
 type HeatmapPaint = Extract<React.ComponentProps<typeof Layer>, { type: "heatmap" }>["paint"];
+type LinePaint = Extract<React.ComponentProps<typeof Layer>, { type: "line" }>["paint"];
+type LineLayout = Extract<React.ComponentProps<typeof Layer>, { type: "line" }>["layout"];
 // >0 snaps coverage to an N-metre grid (keep freshest per cell) = "area covered".
 // 0 = honest dwell density (default). Try 8 (≈ GPS floor) if parked guards over-hot.
 const COVERAGE_BIN_METERS = 0;
+// Stable empty source fed to the always-mounted heatmap while it's toggled OFF, so
+// the hidden layer doesn't re-parse the whole breadcrumb cloud on every clock tick.
+const EMPTY_FC: CoverageCollection = { type: "FeatureCollection", features: [] };
 
 // rAF easing toward the filtered target (smaller = smoother + laggier render).
 const RENDER_EASE = 0.15;
@@ -335,15 +340,20 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
 
   // Coverage heatmap source: org-wide breadcrumbs (incl. self), each weighted by
   // recency. Same poll/clock cadence as the trail memos — never per animation frame.
+  // Skip the build entirely while the heatmap is OFF (the default): the layer is
+  // always mounted for stable z-order, so a stable empty source avoids re-parsing
+  // the whole cloud every tick for output nobody sees.
   const coverageGeoJSON = useMemo(
     () =>
-      buildCoverageGeoJSON(
-        points,
-        nowTick,
-        windowMinutes * 60_000,
-        COVERAGE_BIN_METERS > 0 ? { binMeters: COVERAGE_BIN_METERS } : undefined,
-      ),
-    [points, nowTick, windowMinutes],
+      showHeatmap
+        ? buildCoverageGeoJSON(
+            points,
+            nowTick,
+            windowMinutes * 60_000,
+            COVERAGE_BIN_METERS > 0 ? { binMeters: COVERAGE_BIN_METERS } : undefined,
+          )
+        : EMPTY_FC,
+    [showHeatmap, points, nowTick, windowMinutes],
   );
 
   const myPos = displayPos;
@@ -357,14 +367,46 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     [sharing, displayPos, accuracyM],
   );
 
-  const trailGeoJSON = useMemo(() => {
-    const features = guards
-      .filter((g) => g.pts.length >= 2)
-      .map((g) => lineFeature(g.color, g.pts.map((p) => [p.lon, p.lat])));
+  // Per-guard + self gradient trails. line-gradient is per-source (it can't read a
+  // per-feature colour) so each line gets its OWN lineMetrics source. Each carries a
+  // whole-line `ageNorm` (newest point's recency) driving the package's age-fade
+  // opacity, on top of the newest→oldest line-progress gradient.
+  const trails = useMemo(() => {
+    const windowMs = windowMinutes * 60_000;
+    const build = (key: string, color: string, coords: [number, number][], newestMs: number) => {
+      const spec = trailLineLayer(key, color);
+      return {
+        id: key,
+        sourceId: trailSourceId(key),
+        layerId: spec.id,
+        layout: spec.layout as unknown as LineLayout,
+        paint: spec.paint as unknown as LinePaint,
+        data: {
+          type: "FeatureCollection" as const,
+          features: [
+            {
+              type: "Feature" as const,
+              properties: { ageNorm: ageNorm(newestMs, nowTick, windowMs) },
+              geometry: { type: "LineString" as const, coordinates: coords },
+            },
+          ],
+        },
+      };
+    };
+    const out: ReturnType<typeof build>[] = [];
+    for (const g of guards) {
+      if (g.pts.length < 2) continue;
+      const last = g.pts[g.pts.length - 1];
+      const newestMs = last ? new Date(last.captured_at).getTime() : nowTick;
+      out.push(build(g.id, g.color, g.pts.map((p) => [p.lon, p.lat]), newestMs));
+    }
     const selfLine = trailToLine(myWindowTrail);
-    if (selfLine.length >= 2) features.push(lineFeature(YOU_COLOR, selfLine));
-    return { type: "FeatureCollection" as const, features };
-  }, [guards, myWindowTrail]);
+    if (selfLine.length >= 2) {
+      const lastSelf = myWindowTrail[myWindowTrail.length - 1];
+      out.push(build("self", YOU_COLOR, selfLine, lastSelf ? lastSelf.t : nowTick));
+    }
+    return out;
+  }, [guards, myWindowTrail, nowTick, windowMinutes]);
 
   const fitAll = useCallback(() => {
     const coords: [number, number][] = [];
@@ -408,29 +450,26 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           mapStyle={MAP_STYLES[styleKey]}
           style={{ width: "100%", height: "100%" }}
         >
-          <Source id="trails" type="geojson" data={trailGeoJSON}>
+          {/* Coverage heatmap (M4) — mounted FIRST and never unmounted, so it sits at
+              the BOTTOM of the layer stack; toggled via layout.visibility (not mount)
+              so trails + halo always paint above it regardless of mount timing. */}
+          <Source id={SOURCE_IDS.COVERAGE} type="geojson" data={coverageGeoJSON}>
             <Layer
-              id="trail-lines"
-              type="line"
-              layout={{ "line-cap": "round", "line-join": "round" }}
-              paint={{ "line-color": ["get", "color"], "line-width": 4, "line-opacity": 0.85 }}
+              id={HEATMAP_SPEC.id}
+              type="heatmap"
+              layout={{ visibility: showHeatmap ? "visible" : "none" }}
+              paint={HEATMAP_SPEC.paint as unknown as HeatmapPaint}
             />
           </Source>
 
-          {/* Coverage heatmap (M4). beforeId pins it BELOW the trail line — react-map-gl
-              z-order follows addLayer order, NOT JSX order, and the toggle mounts this
-              after load, so without an anchor it would paint OVER the trails. Rendered
-              after the trails <Source> so "trail-lines" always exists first. */}
-          {showHeatmap && coverageGeoJSON.features.length > 0 && (
-            <Source id={SOURCE_IDS.COVERAGE} type="geojson" data={coverageGeoJSON}>
-              <Layer
-                id={HEATMAP_SPEC.id}
-                type="heatmap"
-                beforeId="trail-lines"
-                paint={HEATMAP_SPEC.paint as unknown as HeatmapPaint}
-              />
+          {/* Per-guard + self gradient trails (M4): one lineMetrics source per line so
+              line-gradient can fade each newest→oldest in that guard's own colour.
+              Mounted after the heatmap so trails always stack above it. */}
+          {trails.map((t) => (
+            <Source key={t.id} id={t.sourceId} type="geojson" lineMetrics data={t.data}>
+              <Layer id={t.layerId} type="line" layout={t.layout} paint={t.paint} />
             </Source>
-          )}
+          ))}
 
           {selfHalo && (
             <Source id="self-accuracy" type="geojson" data={selfHalo}>
@@ -599,14 +638,6 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
       </footer>
     </div>
   );
-}
-
-function lineFeature(color: string, coordinates: [number, number][]) {
-  return {
-    type: "Feature" as const,
-    properties: { color },
-    geometry: { type: "LineString" as const, coordinates },
-  };
 }
 
 // Turn a raw GeolocationPositionError into an actionable, retry-oriented message.

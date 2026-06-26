@@ -1573,6 +1573,150 @@ export type Database = {
         }
         Relationships: []
       }
+      location_breadcrumbs_20260703: {
+        Row: {
+          accuracy_m: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id: string
+          ingested_at: string
+          install_id: string
+          is_keepalive: boolean
+          is_low_confidence: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Insert: {
+          accuracy_m?: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id?: string
+          ingested_at?: string
+          install_id: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Update: {
+          accuracy_m?: number | null
+          captured_at?: string
+          client_seq?: number
+          geom?: unknown
+          guard_id?: string
+          id?: string
+          ingested_at?: string
+          install_id?: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id?: string
+          partition_ts?: string
+          site_id?: string
+        }
+        Relationships: []
+      }
+      location_breadcrumbs_20260704: {
+        Row: {
+          accuracy_m: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id: string
+          ingested_at: string
+          install_id: string
+          is_keepalive: boolean
+          is_low_confidence: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Insert: {
+          accuracy_m?: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id?: string
+          ingested_at?: string
+          install_id: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Update: {
+          accuracy_m?: number | null
+          captured_at?: string
+          client_seq?: number
+          geom?: unknown
+          guard_id?: string
+          id?: string
+          ingested_at?: string
+          install_id?: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id?: string
+          partition_ts?: string
+          site_id?: string
+        }
+        Relationships: []
+      }
+      location_breadcrumbs_20260705: {
+        Row: {
+          accuracy_m: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id: string
+          ingested_at: string
+          install_id: string
+          is_keepalive: boolean
+          is_low_confidence: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Insert: {
+          accuracy_m?: number | null
+          captured_at: string
+          client_seq: number
+          geom: unknown
+          guard_id: string
+          id?: string
+          ingested_at?: string
+          install_id: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id: string
+          partition_ts: string
+          site_id: string
+        }
+        Update: {
+          accuracy_m?: number | null
+          captured_at?: string
+          client_seq?: number
+          geom?: unknown
+          guard_id?: string
+          id?: string
+          ingested_at?: string
+          install_id?: string
+          is_keepalive?: boolean
+          is_low_confidence?: boolean
+          org_id?: string
+          partition_ts?: string
+          site_id?: string
+        }
+        Relationships: []
+      }
       location_breadcrumbs_default: {
         Row: {
           accuracy_m: number | null
@@ -1858,6 +2002,19 @@ export type Database = {
         Args: { p_ahead?: number; p_behind?: number }
         Returns: number
       }
+      live_positions: {
+        Args: { p_site: string }
+        Returns: {
+          accuracy_m: number
+          captured_at: string
+          color: string
+          display_name: string
+          guard_id: string
+          lat: number
+          lon: number
+          online: boolean
+        }[]
+      }
       purge_aged_audit_log: { Args: { p_keep_days?: number }; Returns: number }
       purge_expired_breadcrumbs: { Args: never; Returns: number }
       tag_checkpoint: {
@@ -1869,6 +2026,8 @@ export type Database = {
         Returns: {
           accuracy_m: number
           captured_at: string
+          color: string
+          display_name: string
           guard_id: string
           lat: number
           lon: number

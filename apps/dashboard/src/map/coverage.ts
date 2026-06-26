@@ -1,6 +1,7 @@
 // Coverage-heatmap source builder, kept SEPARATE from the live-dot/trail code.
-// Maps the org-wide polled breadcrumb cloud (already 5s-decimated + low-confidence
-// /keepalive-excluded by the demo_live_map RPC) into a GeoJSON Point collection
+// Maps the site-scoped breadcrumb cloud (seeded from trail_window + fed by the
+// site:{id} realtime broadcast, 5s-decimated client-side in livePoints.mergePoints,
+// low-confidence/keepalive already excluded server-side) into a GeoJSON Point collection
 // where each feature carries a recency weight `ageNorm` ∈ [0,1] (0 = now, 1 =
 // window edge). The @trailme/map-style heatmap reads that exact property, so a
 // freshly-walked spot glows and an aging one fades to nothing. Pure: no React, no DOM.

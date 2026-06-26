@@ -10,7 +10,9 @@ import { SignOutButton } from "@/components/SignOutButton";
 import { GpsKalman } from "./gpsKalman";
 import { pushTrailPoint, trailToLine, type TrailPoint } from "./trail";
 import { ageNorm, buildCoverageGeoJSON, type CoverageCollection } from "./coverage";
+import { mergePoints, type LivePoint, type PosPayload } from "./livePoints";
 import { circlePolygon, metersBetween } from "./geo";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 
 const DEFAULT_CENTER = { longitude: 10.7522, latitude: 59.9139, zoom: 13 };
 
@@ -55,25 +57,22 @@ type MapShellProps = {
   orgName: string | null;
   role: Role | null;
   email?: string;
-};
-
-type LivePoint = {
-  guard_id: string;
-  display_name: string | null;
-  color: string | null;
-  lat: number;
-  lon: number;
-  captured_at: string;
+  // Sites whose live channels this viewer subscribes to: a control room gets all
+  // org sites, a guard gets only their assigned site(s). Resolved server-side.
+  subscribeSites: { id: string; name: string }[];
 };
 
 type Guard = { id: string; name: string; color: string; pts: LivePoint[] };
 type LL = { lng: number; lat: number };
 
-export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
+export function MapShell({ orgId, orgName, role, email, subscribeSites }: MapShellProps) {
   const [windowMinutes, setWindowMinutes] = useState<TimeWindow>(15);
   const [points, setPoints] = useState<LivePoint[]>([]);
   const [sharing, setSharing] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
+  // Realtime socket health, tracked SEPARATELY from shareError (a GPS string) so the
+  // two never clobber each other; self-clears when a channel resubscribes.
+  const [channelError, setChannelError] = useState<string | null>(null);
   const [styleKey, setStyleKey] = useState<StyleKey>("satellite");
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [myId, setMyId] = useState<string | null>(null);
@@ -98,6 +97,7 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
   const selfKf = useRef<GpsKalman | null>(null);
   const targetRef = useRef<LL | null>(null); // latest filtered position
   const renderedRef = useRef<LL | null>(null); // interpolated position
+  const liveBuf = useRef<PosPayload[]>([]); // broadcast/fallback fixes awaiting the 1Hz flush
 
   const supabase = useMemo(() => createClient(), []);
   const mapboxToken = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
@@ -120,26 +120,94 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
     return () => clearInterval(id);
   }, []);
 
-  // Poll the live map (org-wide positions + recent trail points).
+  // Seed the trail/heatmap history once per site (the full 120-min buffer; the
+  // window selector trims client-side). Live ticks accumulate on top of this.
   useEffect(() => {
-    if (!orgId) return;
+    if (!orgId || subscribeSites.length === 0) return;
     let active = true;
-    async function load() {
-      const { data, error } = await supabase.rpc("demo_live_map", { p_minutes: windowMinutes });
-      if (!active) return;
-      if (error) {
-        setShareError(`Live map: ${error.message}`);
-        return;
+    void (async () => {
+      const seed: LivePoint[] = [];
+      for (const s of subscribeSites) {
+        const { data } = await supabase.rpc("trail_window", { p_site: s.id, p_minutes: 120 });
+        if (!active) return;
+        // A per-site authz reject (subscribe-set is optimistic from the JWT while
+        // server authz is live) is non-fatal — skip the site, keep the rest.
+        if (data) seed.push(...(data as LivePoint[]));
       }
-      if (data) setPoints(data as LivePoint[]);
-    }
-    void load();
-    const id = setInterval(load, 1500);
+      if (active) setPoints(seed);
+    })();
     return () => {
       active = false;
-      clearInterval(id);
     };
-  }, [orgId, windowMinutes, supabase]);
+  }, [orgId, subscribeSites, supabase]);
+
+  // Subscribe to each site's private broadcast channel; drain incoming server-stamped
+  // fixes into `points` at ~1Hz; reconcile every 18s against guard_positions so a
+  // silently-dead socket still refreshes. realtime-js auto-reconnects the socket; the
+  // 18s reconcile is the safety net while a channel is recovering.
+  useEffect(() => {
+    if (!orgId || subscribeSites.length === 0) return;
+    let active = true;
+    const channels: RealtimeChannel[] = [];
+
+    void (async () => {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!active) return;
+      await supabase.realtime.setAuth(session?.access_token ?? null);
+      if (!active) return;
+      for (const s of subscribeSites) {
+        const ch = supabase
+          .channel(`site:${s.id}`, { config: { private: true } })
+          .on("broadcast", { event: "pos" }, ({ payload }) => {
+            liveBuf.current.push(payload as PosPayload);
+          })
+          .subscribe((status) => {
+            if (status === "SUBSCRIBED") setChannelError(null);
+            else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+              setChannelError("Live connection dropped — reconnecting…");
+            }
+          });
+        channels.push(ch);
+      }
+    })();
+
+    const flush = window.setInterval(() => {
+      if (liveBuf.current.length === 0) return;
+      const batch = liveBuf.current;
+      liveBuf.current = [];
+      setPoints((prev) => mergePoints(prev, batch, Date.now()));
+    }, 1000);
+
+    const reconcile = window.setInterval(() => {
+      void (async () => {
+        for (const s of subscribeSites) {
+          const { data } = await supabase.rpc("live_positions", { p_site: s.id });
+          if (data) liveBuf.current.push(...(data as PosPayload[]));
+        }
+      })();
+    }, 18000);
+
+    return () => {
+      active = false;
+      clearInterval(flush);
+      clearInterval(reconcile);
+      for (const ch of channels) void supabase.removeChannel(ch);
+    };
+  }, [orgId, subscribeSites, supabase]);
+
+  // Keep the realtime socket's JWT fresh so private channels don't die at token expiry.
+  useEffect(() => {
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "TOKEN_REFRESHED" || event === "SIGNED_IN") {
+        void supabase.realtime.setAuth(session?.access_token ?? null);
+      }
+    });
+    return () => subscription.unsubscribe();
+  }, [supabase]);
 
   // Watch teardown on unmount.
   useEffect(() => {
@@ -622,19 +690,24 @@ export function MapShell({ orgId, orgName, role, email }: MapShellProps) {
           maxWidth: "28rem",
         }}
       >
-        {shareError
-          ? `Location error: ${shareError}`
-          : sharing
-            ? hidden
-              ? "Sharing paused — phone asleep or tab hidden. Reopen this tab to resume."
-              : locating
-                ? "Allow location, then hold tight — getting your first GPS fix…"
-                : myPos
-                  ? `Sharing your location${accuracyM != null ? ` · GPS ±${Math.round(accuracyM)} m` : ""} — walk and watch your trail build.`
-                  : "Sharing — waiting for your first GPS fix…"
-            : onMapCount
-              ? `${onMapCount} on the map over the last ${windowMinutes}m.`
-              : "Tap “Share my location”, allow access, and walk — your trail appears here."}
+        <div>
+          {shareError
+            ? `Location error: ${shareError}`
+            : sharing
+              ? hidden
+                ? "Sharing paused — phone asleep or tab hidden. Reopen this tab to resume."
+                : locating
+                  ? "Allow location, then hold tight — getting your first GPS fix…"
+                  : myPos
+                    ? `Sharing your location${accuracyM != null ? ` · GPS ±${Math.round(accuracyM)} m` : ""} — walk and watch your trail build.`
+                    : "Sharing — waiting for your first GPS fix…"
+              : onMapCount
+                ? `${onMapCount} on the map over the last ${windowMinutes}m.`
+                : "Tap “Share my location”, allow access, and walk — your trail appears here."}
+        </div>
+        {channelError && (
+          <div style={{ marginTop: "0.25rem", color: "#fbbf24", fontSize: "0.75rem" }}>◌ {channelError}</div>
+        )}
       </footer>
     </div>
   );

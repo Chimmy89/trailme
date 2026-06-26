@@ -31,6 +31,10 @@ export default async function MapPage() {
   const role = (claimMeta.role as Role | undefined) ?? null;
 
   let orgName: string | null = null;
+  // Live channels this viewer subscribes to: a control room (org_admin/supervisor)
+  // gets every org site; a guard gets only the sites they're assigned to (the
+  // channel RLS rejects the rest anyway, but we don't even attempt them).
+  let subscribeSites: { id: string; name: string }[] = [];
   if (orgId) {
     const { data: org } = await supabase
       .from("organizations")
@@ -38,6 +42,21 @@ export default async function MapPage() {
       .eq("id", orgId)
       .maybeSingle();
     orgName = org?.name ?? null;
+
+    if (role === "org_admin" || role === "supervisor") {
+      const { data } = await supabase.from("sites").select("id,name").eq("org_id", orgId);
+      subscribeSites = data ?? [];
+    } else {
+      const siteIds = (claimMeta.site_ids as string[] | undefined) ?? [];
+      if (siteIds.length > 0) {
+        const { data } = await supabase
+          .from("sites")
+          .select("id,name")
+          .eq("org_id", orgId)
+          .in("id", siteIds);
+        subscribeSites = data ?? [];
+      }
+    }
   }
 
   return (
@@ -46,6 +65,7 @@ export default async function MapPage() {
       orgName={orgName}
       role={role}
       email={user.email}
+      subscribeSites={subscribeSites}
     />
   );
 }
